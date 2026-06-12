@@ -11,6 +11,7 @@
     "smoke": "node scripts/smoke.js"
   },
   "dependencies": {
+    "express": "^5.2.1",
     "socket.io": "^4.8.1"
   },
   "devDependencies": {

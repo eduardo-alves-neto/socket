@@ -1,3 +1,4 @@
+import express from "express";
 import { createServer } from "node:http";
 import { Server } from "socket.io";
 import { NAMESPACE, SOCKET_PATH } from "./events.js";
@@ -5,15 +6,13 @@ import { registerHandlers } from "./handlers.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
 
-const httpServer = createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
-    return;
-  }
-  res.writeHead(404);
-  res.end();
+const app = express();
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
 });
+
+const httpServer = createServer(app);
 
 const io = new Server(httpServer, {
   path: SOCKET_PATH,
