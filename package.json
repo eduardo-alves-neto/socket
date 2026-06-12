@@ -1,0 +1,19 @@
+{
+  "name": "remote-support-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Servidor Socket.IO para suporte remoto (co-browsing) do One",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}
