@@ -2,7 +2,10 @@ package socketio
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"net/http"
+	"runtime/debug"
 
 	sio "github.com/doquangtan/socketio/v4"
 
@@ -199,15 +202,27 @@ func (h *Handler) onConnection(socket *sio.Socket) {
 
 func (h *Handler) withAck(_ *sio.Socket, fn func(context.Context, *sio.EventPayload) (any, error)) func(*sio.EventPayload) {
 	return func(event *sio.EventPayload) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[withAck] PANIC recuperado: %v\n%s", r, debug.Stack())
+				if event.Ack != nil {
+					event.Ack(ackError(fmt.Errorf("erro interno: %v", r)))
+				}
+			}
+		}()
+		log.Printf("[withAck] evento recebido: %s | ack=%v", event.Name, event.Ack != nil)
 		ctx := context.Background()
 		data, err := fn(ctx, event)
 		if event.Ack == nil {
+			log.Printf("[withAck] event.Ack e nil para evento: %s — ACK nao sera enviado", event.Name)
 			return
 		}
 		if err != nil {
+			log.Printf("[withAck] erro no handler de %s: %v", event.Name, err)
 			event.Ack(ackError(err))
 			return
 		}
+		log.Printf("[withAck] ACK ok enviado para: %s", event.Name)
 		event.Ack(ackOK(data))
 	}
 }
