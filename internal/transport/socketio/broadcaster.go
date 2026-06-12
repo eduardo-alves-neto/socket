@@ -2,6 +2,7 @@ package socketio
 
 import (
 	"context"
+	"log"
 	"sync"
 
 	sio "github.com/doquangtan/socketio/v4"
@@ -99,9 +100,21 @@ func (g *Gateway) EmitToRoom(ctx context.Context, room string, event string, pay
 	_ = ctx
 	namespace := g.currentNamespace()
 	if namespace == nil {
+		log.Printf("[EmitToRoom] namespace nil — ignorando room=%s event=%s", room, event)
 		return nil
 	}
-	return namespace.To(room).Emit(event, payload)
+	sockets := namespace.To(room).Sockets()
+	log.Printf("[EmitToRoom] room=%s event=%s sockets_na_sala=%d", room, event, len(sockets))
+	for i, socket := range sockets {
+		log.Printf("[EmitToRoom] emitindo para socket[%d] id=%s", i, socket.Id)
+		if err := socket.Emit(event, payload); err != nil {
+			log.Printf("[EmitToRoom] erro ao emitir para socket[%d] id=%s: %v", i, socket.Id, err)
+		} else {
+			log.Printf("[EmitToRoom] socket[%d] id=%s ok", i, socket.Id)
+		}
+	}
+	log.Printf("[EmitToRoom] concluido room=%s event=%s", room, event)
+	return nil
 }
 
 func (g *Gateway) EmitAll(ctx context.Context, event string, payload any) error {
