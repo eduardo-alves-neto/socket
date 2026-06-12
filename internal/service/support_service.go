@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"log"
 	"sort"
 	"time"
 
@@ -494,6 +495,8 @@ func (s *Service) AcceptTicket(ctx context.Context, in AcceptTicketInput) (Accep
 }
 
 func (s *Service) ConfirmSession(ctx context.Context, in ConfirmSessionInput) (ConfirmSessionOutput, error) {
+	log.Printf("[ConfirmSession] inicio userID=%s sessionCode=%s approved=%v", in.UserID, in.SessionCode, in.Approved)
+
 	if in.UserID == "" {
 		return ConfirmSessionOutput{}, domain.InvalidPayload("userId e obrigatorio", nil)
 	}
@@ -505,21 +508,31 @@ func (s *Service) ConfirmSession(ctx context.Context, in ConfirmSessionInput) (C
 	var out ConfirmSessionOutput
 	var effects []effect
 
+	log.Printf("[ConfirmSession] entrando em repo.Update")
 	err := s.repo.Update(func(st *store.State) error {
+		log.Printf("[ConfirmSession] dentro do Update — total sessoes=%d total usuarios=%d", len(st.Sessions), len(st.Users))
+
 		session, ok := st.Sessions[in.SessionCode]
 		if !ok {
+			log.Printf("[ConfirmSession] sessao nao encontrada: %s", in.SessionCode)
 			return domain.NotFound("sessao nao encontrada", map[string]any{"sessionCode": in.SessionCode})
 		}
+		log.Printf("[ConfirmSession] sessao encontrada status=%s requesterID=%s agentID=%s", session.Status, session.RequesterID, session.AgentID)
+
 		if session.RequesterID != in.UserID {
+			log.Printf("[ConfirmSession] FORBIDDEN requesterID=%s != userID=%s", session.RequesterID, in.UserID)
 			return domain.Forbidden("somente o usuario assistido pode confirmar a sessao", nil)
 		}
 
 		ticket, ok := st.Tickets[session.TicketID]
 		if !ok {
+			log.Printf("[ConfirmSession] ticket nao encontrado: %s", session.TicketID)
 			return domain.NotFound("chamado da sessao nao encontrado", map[string]any{"ticketId": session.TicketID})
 		}
+		log.Printf("[ConfirmSession] ticket encontrado id=%s status=%s", ticket.ID, ticket.Status)
 
 		if session.Status == domain.StatusWaitingUserApproval && session.ApprovalExpiresAt != nil && !now.Before(*session.ApprovalExpiresAt) {
+			log.Printf("[ConfirmSession] aprovacao expirada expiresAt=%v now=%v", session.ApprovalExpiresAt, now)
 			if err := expireWaitingSession(st, &ticket, &session, now, "approval_ttl"); err != nil {
 				return err
 			}
@@ -530,11 +543,15 @@ func (s *Service) ConfirmSession(ctx context.Context, in ConfirmSessionInput) (C
 			effects = appendSessionFinishedEffects(effects, session, ticket, "expired")
 			return domain.Expired("confirmacao expirada", map[string]any{"sessionCode": in.SessionCode})
 		}
+
+		log.Printf("[ConfirmSession] checando transicao de estado %s -> %s", session.Status, statusAfterConfirmation(in.Approved))
 		if err := domain.Transition(session.Status, statusAfterConfirmation(in.Approved)); err != nil {
+			log.Printf("[ConfirmSession] transicao invalida: %v", err)
 			return err
 		}
 
 		if !in.Approved {
+			log.Printf("[ConfirmSession] sessao REJEITADA")
 			session.Status = domain.StatusRejected
 			session.FinishedAt = &now
 			session.FinishReason = "approval_rejected"
@@ -552,17 +569,24 @@ func (s *Service) ConfirmSession(ctx context.Context, in ConfirmSessionInput) (C
 			out.Ticket = ticket
 			out.Session = session
 			effects = appendSessionFinishedEffects(effects, session, ticket, "rejected")
+			log.Printf("[ConfirmSession] rejeicao processada, %d effects enfileirados", len(effects))
 			return nil
 		}
 
+		log.Printf("[ConfirmSession] aprovando — buscando usuarios requester=%s agent=%s", in.UserID, session.AgentID)
 		requester, ok := st.Users[in.UserID]
 		if !ok {
+			log.Printf("[ConfirmSession] requester nao encontrado no store: %s (usuarios registrados: %v)", in.UserID, userIDsInStore(st))
 			return domain.NotFound("usuario assistido nao registrado", map[string]any{"userId": in.UserID})
 		}
+		log.Printf("[ConfirmSession] requester encontrado name=%s online=%v socketID=%s", requester.Name, requester.Online, requester.SocketID)
+
 		agent, ok := st.Users[session.AgentID]
 		if !ok {
+			log.Printf("[ConfirmSession] agent nao encontrado no store: %s", session.AgentID)
 			return domain.NotFound("atendente nao registrado", map[string]any{"agentId": session.AgentID})
 		}
+		log.Printf("[ConfirmSession] agent encontrado name=%s online=%v socketID=%s", agent.Name, agent.Online, agent.SocketID)
 
 		session.Status = domain.StatusActive
 		session.ActiveAt = &now
@@ -604,15 +628,27 @@ func (s *Service) ConfirmSession(ctx context.Context, in ConfirmSessionInput) (C
 			effect{kind: effectEmitRoom, room: room, event: "session:active", payload: out},
 			effect{kind: effectEmitRoom, room: room, event: "log:appended", payload: logEntry},
 		)
+		log.Printf("[ConfirmSession] aprovacao processada, %d effects enfileirados para sala %s", len(effects), room)
 		return nil
 	})
+
+	log.Printf("[ConfirmSession] repo.Update concluido err=%v — disparando %d effects", err, len(effects))
 	if err != nil {
 		s.dispatch(ctx, effects)
 		return ConfirmSessionOutput{}, err
 	}
 
 	s.dispatch(ctx, effects)
+	log.Printf("[ConfirmSession] dispatch concluido — retornando ok")
 	return out, nil
+}
+
+func userIDsInStore(st *store.State) []string {
+	ids := make([]string, 0, len(st.Users))
+	for id := range st.Users {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func (s *Service) FinishSession(ctx context.Context, in FinishSessionInput) (FinishSessionOutput, error) {
@@ -887,24 +923,36 @@ func (s *Service) now() time.Time {
 }
 
 func (s *Service) dispatch(ctx context.Context, effects []effect) {
-	for _, item := range effects {
+	log.Printf("[dispatch] executando %d effects", len(effects))
+	for i, item := range effects {
+		log.Printf("[dispatch] effect[%d] kind=%s userID=%s room=%s event=%s", i, item.kind, item.userID, item.room, item.event)
 		switch item.kind {
 		case effectBindUserSocket:
-			_ = s.realtime.BindUserSocket(ctx, item.userID, item.socketID)
+			err := s.realtime.BindUserSocket(ctx, item.userID, item.socketID)
+			log.Printf("[dispatch] BindUserSocket userID=%s socketID=%s err=%v", item.userID, item.socketID, err)
 		case effectUnbindSocket:
-			_ = s.realtime.UnbindSocket(ctx, item.socketID)
+			err := s.realtime.UnbindSocket(ctx, item.socketID)
+			log.Printf("[dispatch] UnbindSocket socketID=%s err=%v", item.socketID, err)
 		case effectJoinUser:
-			_ = s.realtime.JoinUser(ctx, item.userID, item.room)
+			log.Printf("[dispatch] JoinUser iniciando userID=%s room=%s", item.userID, item.room)
+			err := s.realtime.JoinUser(ctx, item.userID, item.room)
+			log.Printf("[dispatch] JoinUser concluido userID=%s room=%s err=%v", item.userID, item.room, err)
 		case effectLeaveUser:
-			_ = s.realtime.LeaveUser(ctx, item.userID, item.room)
+			err := s.realtime.LeaveUser(ctx, item.userID, item.room)
+			log.Printf("[dispatch] LeaveUser userID=%s room=%s err=%v", item.userID, item.room, err)
 		case effectEmitUser:
-			_ = s.realtime.EmitToUser(ctx, item.userID, item.event, item.payload)
+			log.Printf("[dispatch] EmitToUser iniciando userID=%s event=%s", item.userID, item.event)
+			err := s.realtime.EmitToUser(ctx, item.userID, item.event, item.payload)
+			log.Printf("[dispatch] EmitToUser concluido userID=%s event=%s err=%v", item.userID, item.event, err)
 		case effectEmitRoom:
-			_ = s.realtime.EmitToRoom(ctx, item.room, item.event, item.payload)
+			log.Printf("[dispatch] EmitToRoom iniciando room=%s event=%s", item.room, item.event)
+			err := s.realtime.EmitToRoom(ctx, item.room, item.event, item.payload)
+			log.Printf("[dispatch] EmitToRoom concluido room=%s event=%s err=%v", item.room, item.event, err)
 		case effectEmitAll:
 			_ = s.realtime.EmitAll(ctx, item.event, item.payload)
 		}
 	}
+	log.Printf("[dispatch] todos os effects concluidos")
 }
 
 func statusAfterConfirmation(approved bool) domain.SupportStatus {

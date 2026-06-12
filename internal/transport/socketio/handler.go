@@ -114,24 +114,36 @@ func (h *Handler) onConnection(socket *sio.Socket) {
 	}))
 
 	socket.On("session:confirm", h.withAck(socket, func(ctx context.Context, event *sio.EventPayload) (any, error) {
+		log.Printf("[session:confirm] evento recebido socketId=%s dataLen=%d", socket.Id, len(event.Data))
 		var payload confirmSessionPayload
 		trace, err := decodeEnvelope(event, &payload)
 		if err != nil {
+			log.Printf("[session:confirm] decodeEnvelope erro: %v", err)
 			return nil, err
 		}
+		log.Printf("[session:confirm] payload decodificado sessionCode=%q approved=%v trace=%s", payload.SessionCode, payload.Approved, trace)
 		if payload.Approved == nil {
+			log.Printf("[session:confirm] approved e nil — rejeitando")
 			return nil, domain.InvalidPayload("approved e obrigatorio", nil)
 		}
 		userID, err := h.requireRegistered(ctx, socket.Id)
 		if err != nil {
+			log.Printf("[session:confirm] requireRegistered erro socketId=%s: %v", socket.Id, err)
 			return nil, err
 		}
-		return h.service.ConfirmSession(ctx, service.ConfirmSessionInput{
+		log.Printf("[session:confirm] chamando ConfirmSession userID=%s sessionCode=%s approved=%v", userID, payload.SessionCode, *payload.Approved)
+		result, err := h.service.ConfirmSession(ctx, service.ConfirmSessionInput{
 			UserID:         userID,
 			SessionCode:    payload.SessionCode,
 			Approved:       *payload.Approved,
 			OperationTrace: trace,
 		})
+		if err != nil {
+			log.Printf("[session:confirm] ConfirmSession retornou erro: %v", err)
+			return nil, err
+		}
+		log.Printf("[session:confirm] ConfirmSession ok sessionStatus=%s", result.Session.Status)
+		return result, nil
 	}))
 
 	socket.On("session:finish", h.withAck(socket, func(ctx context.Context, event *sio.EventPayload) (any, error) {
