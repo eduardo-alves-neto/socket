@@ -1,3 +1,4 @@
+import cors from "cors";
 import express from "express";
 import { createServer } from "node:http";
 import { Server } from "socket.io";
@@ -6,7 +7,13 @@ import { registerHandlers } from "./handlers.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
 
+const CORS_ORIGINS = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(",").map((o) => o.trim())
+  : ["http://localhost:3000", "http://localhost:5173"];
+
 const app = express();
+
+app.use(cors({ origin: CORS_ORIGINS, credentials: true }));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
