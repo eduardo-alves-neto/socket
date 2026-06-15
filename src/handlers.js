@@ -8,6 +8,7 @@ import {
   createParticipant,
   createTicketWithSession,
   isAgent,
+  isOpenTicket,
   listAgents,
   now,
   sessions,
@@ -178,6 +179,15 @@ export function registerHandlers(nsp) {
           throw new SupportError("AGENT_NOT_FOUND", "Atendente não encontrado");
         if (agent.id === requester.id)
           throw new SupportError("INVALID_PAYLOAD", "Não é possível solicitar suporte a si mesmo");
+
+        const existingOpen = [...tickets.values()].find(
+          (t) => isOpenTicket(t) && t.requesterId === requester.id,
+        );
+        if (existingOpen)
+          throw new SupportError(
+            "ALREADY_HAS_OPEN_TICKET",
+            "Você já possui um chamado em aberto",
+          );
 
         const { ticket, session } = createTicketWithSession({
           requesterId: requester.id,

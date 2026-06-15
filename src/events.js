@@ -34,8 +34,11 @@ export const PERMISSIONS = {
   AGENT: "remote-support.agent",
 };
 
+// Altere TICKET_SECONDS para definir quantos segundos o atendente tem para aceitar o chamado.
+const TICKET_SECONDS = 60;
+
 export const TTL = {
-  TICKET_MS: 5 * 60 * 1000,
+  TICKET_MS: TICKET_SECONDS * 1000,
   APPROVAL_MS: 90 * 1000,
   SESSION_STALE_MS: 2 * 60 * 1000,
   SWEEP_INTERVAL_MS: 15 * 1000,
