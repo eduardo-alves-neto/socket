@@ -71,6 +71,42 @@ export function createParticipant(userId, role) {
   };
 }
 
+export function createSessionWithTickets({ requesterId, agentIds, mode, ttlMs }) {
+  const ts = now();
+  const sessionCode = randomUUID();
+  const session = {
+    code: sessionCode,
+    requesterId,
+    agentIds,
+    mode,
+    status: "requested",
+    participants: { [requesterId]: createParticipant(requesterId, "requester") },
+    cobrowsingEvents: [],
+    logs: [],
+    createdAt: ts,
+    updatedAt: ts,
+  };
+  sessions.set(session.code, session);
+
+  const createdTickets = agentIds.map((agentId) => {
+    const ticket = {
+      id: randomUUID(),
+      sessionCode,
+      requesterId,
+      agentId,
+      mode,
+      status: "requested",
+      createdAt: ts,
+      updatedAt: ts,
+      expiresAt: new Date(Date.now() + ttlMs).toISOString(),
+    };
+    tickets.set(ticket.id, ticket);
+    return ticket;
+  });
+
+  return { session, tickets: createdTickets };
+}
+
 export function createTicketWithSession({ requesterId, agentId, mode, ttlMs }) {
   const ts = now();
   const ticket = {
