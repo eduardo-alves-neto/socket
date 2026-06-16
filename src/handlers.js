@@ -466,7 +466,8 @@ export function registerHandlers(nsp) {
         emitLog(session, {
           actorId: userId,
           type: `cobrowsing_${data.type}`,
-          message: `Evento ${data.type}`,
+          // Mensagem amigável é montada no frontend (tem contexto do DOM); fallback genérico.
+          message: data.payload?.message ?? `Evento ${data.type}`,
           data: data.payload,
         });
       }
