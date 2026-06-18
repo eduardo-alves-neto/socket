@@ -110,6 +110,38 @@ try {
   const cbEvent = await eventOnAgent;
   assert(cbEvent.type === "click", "cobrowsing retransmitido");
 
+  console.log("6b. cobrowsing route_changed (base do seguimento de rota do agente)");
+  const routeEventOnAgent = waitFor(agent, "cobrowsing:event_received");
+  user.emit("cobrowsing:event", {
+    operationTrace: randomUUID(),
+    data: {
+      sessionCode: ticket.sessionCode,
+      type: "route_changed",
+      payload: { route: "/clientes", message: "Navegou para /clientes" },
+    },
+  });
+  const routeEvent = await routeEventOnAgent;
+  assert(routeEvent.type === "route_changed", "route_changed retransmitido");
+  assert(routeEvent.payload?.route === "/clientes", "rota preservada no payload");
+  assert(routeEvent.userId === "user-1", "userId do emissor preservado");
+  assert(typeof routeEvent.id === "string", "evento tem id gerado");
+  assert(typeof routeEvent.createdAt === "string", "evento tem createdAt");
+
+  console.log("6c. cobrowsing scroll_changed (sem rota — não dispara navegação)");
+  const scrollEventOnAgent = waitFor(agent, "cobrowsing:event_received");
+  user.emit("cobrowsing:event", {
+    operationTrace: randomUUID(),
+    data: {
+      sessionCode: ticket.sessionCode,
+      type: "scroll_changed",
+      payload: { scrollX: 0, scrollY: 300, message: "Rolagem" },
+    },
+  });
+  const scrollEvent = await scrollEventOnAgent;
+  assert(scrollEvent.type === "scroll_changed", "scroll_changed retransmitido");
+  assert(scrollEvent.payload?.scrollY === 300, "scrollY preservado");
+  assert(scrollEvent.payload?.route === undefined, "scroll_changed não carrega rota");
+
   console.log("7. permissões granulares");
   const permissionRequestedOnUser = waitFor(user, "permission:requested");
   const permissionStateOnAgent = waitFor(agent, "permission:state");
