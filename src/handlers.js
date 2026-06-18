@@ -1,6 +1,8 @@
 import { EVENTS, PERMISSIONS, TTL } from "./events.js";
 import {
   SupportError,
+  applyGrant,
+  applyRevoke,
   appendCobrowsingEvent,
   appendLog,
   buildBootstrap,
@@ -10,6 +12,7 @@ import {
   isAgent,
   isOpenTicket,
   listAgents,
+  normalizeSessionPermissions,
   now,
   sessions,
   setTimer,
@@ -47,7 +50,28 @@ function requireRegistered(socket) {
 function getSession(sessionCode) {
   const session = sessions.get(sessionCode);
   if (!session) throw new SupportError("SESSION_NOT_FOUND", "Sessão não encontrada");
+  session.permissions ??= [];
+  session.pendingPermissions ??= [];
   return session;
+}
+
+function parseSessionPermissions(value) {
+  if (!Array.isArray(value)) return [];
+  const permissions = normalizeSessionPermissions(value);
+  if (permissions.length !== value.length) {
+    throw new SupportError("INVALID_PAYLOAD", "Permissão de sessão inválida");
+  }
+  return permissions;
+}
+
+function requireActiveParticipant(socket, sessionCode) {
+  const user = requireRegistered(socket);
+  const session = getSession(sessionCode);
+  if (session.status !== "active")
+    throw new SupportError("INVALID_STATE", `Sessão em estado inválido: ${session.status}`);
+  const participant = session.participants[user.id];
+  if (!participant) throw new SupportError("FORBIDDEN", "Usuário não participa desta sessão");
+  return { user, session, participant };
 }
 
 export function registerHandlers(nsp) {
@@ -59,6 +83,18 @@ export function registerHandlers(nsp) {
     const log = appendLog(session, entry);
     nsp.to(sessionRoom(session.code)).emit(EVENTS.LOG_APPENDED, log);
     return log;
+  }
+
+  function permissionState(session) {
+    return {
+      sessionCode: session.code,
+      permissions: session.permissions ?? [],
+      pendingPermissions: session.pendingPermissions ?? [],
+    };
+  }
+
+  function emitPermissionState(session) {
+    nsp.to(sessionRoom(session.code)).emit(EVENTS.PERMISSION_STATE, permissionState(session));
   }
 
   function touch(...records) {
@@ -225,6 +261,7 @@ export function registerHandlers(nsp) {
           agentIds,
           mode: data.mode,
           ttlMs: TTL.TICKET_MS,
+          permissions: parseSessionPermissions(data.permissions),
         });
 
         appendLog(session, {
@@ -246,7 +283,7 @@ export function registerHandlers(nsp) {
           );
         }
 
-        return { tickets: createdTickets, session };
+        return { ticket: createdTickets[0], tickets: createdTickets, session };
       }),
     );
 
@@ -421,6 +458,102 @@ export function registerHandlers(nsp) {
     );
 
     socket.on(
+      EVENTS.PERMISSION_REQUEST,
+      withAck(socket, (data) => {
+        const { user, session, participant } = requireActiveParticipant(socket, data.sessionCode);
+        if (participant.role !== "agent")
+          throw new SupportError("FORBIDDEN", "Apenas atendentes podem solicitar permissões");
+
+        const requested = parseSessionPermissions(data.permissions);
+        session.pendingPermissions = normalizeSessionPermissions([
+          ...(session.pendingPermissions ?? []),
+          ...requested.filter((permission) => !(session.permissions ?? []).includes(permission)),
+        ]);
+        touch(session);
+
+        const payload = { sessionCode: session.code, permissions: requested };
+        nsp.to(userRoom(session.requesterId)).emit(EVENTS.PERMISSION_REQUESTED, payload);
+        emitPermissionState(session);
+        emitLog(session, {
+          actorId: user.id,
+          type: "permission_requested",
+          message: "Permissão solicitada",
+          data: { permissions: requested },
+        });
+        return permissionState(session);
+      }),
+    );
+
+    socket.on(
+      EVENTS.PERMISSION_CANCEL,
+      withAck(socket, (data) => {
+        const { session, participant } = requireActiveParticipant(socket, data.sessionCode);
+        if (participant.role !== "agent")
+          throw new SupportError("FORBIDDEN", "Apenas atendentes podem cancelar solicitações");
+
+        const cancelled = parseSessionPermissions(data.permissions);
+        session.pendingPermissions = (session.pendingPermissions ?? []).filter(
+          (permission) => !cancelled.includes(permission),
+        );
+        touch(session);
+        emitPermissionState(session);
+        return permissionState(session);
+      }),
+    );
+
+    socket.on(
+      EVENTS.PERMISSION_GRANT,
+      withAck(socket, (data) => {
+        const { user, session, participant } = requireActiveParticipant(socket, data.sessionCode);
+        if (participant.role !== "requester")
+          throw new SupportError("FORBIDDEN", "Apenas o solicitante pode conceder permissões");
+
+        const granted = applyGrant([], parseSessionPermissions(data.permissions));
+        session.permissions = applyGrant(session.permissions, granted);
+        session.pendingPermissions = (session.pendingPermissions ?? []).filter(
+          (permission) => !granted.includes(permission),
+        );
+        touch(session);
+
+        const payload = { sessionCode: session.code, permissions: granted };
+        nsp.to(sessionRoom(session.code)).emit(EVENTS.PERMISSION_GRANTED, payload);
+        emitPermissionState(session);
+        emitLog(session, {
+          actorId: user.id,
+          type: "permission_granted",
+          message: "Permissão concedida",
+          data: { permissions: granted },
+        });
+        return permissionState(session);
+      }),
+    );
+
+    socket.on(
+      EVENTS.PERMISSION_REVOKE,
+      withAck(socket, (data) => {
+        const { user, session, participant } = requireActiveParticipant(socket, data.sessionCode);
+        if (participant.role !== "requester")
+          throw new SupportError("FORBIDDEN", "Apenas o solicitante pode revogar permissões");
+
+        const revoked = parseSessionPermissions(data.permissions);
+        session.permissions = applyRevoke(session.permissions, revoked);
+        session.pendingPermissions = applyRevoke(session.pendingPermissions, revoked);
+        touch(session);
+
+        const payload = { sessionCode: session.code, permissions: revoked };
+        nsp.to(sessionRoom(session.code)).emit(EVENTS.PERMISSION_REVOKED, payload);
+        emitPermissionState(session);
+        emitLog(session, {
+          actorId: user.id,
+          type: "permission_revoked",
+          message: "Permissão revogada",
+          data: { permissions: revoked },
+        });
+        return permissionState(session);
+      }),
+    );
+
+    socket.on(
       EVENTS.SESSION_HEARTBEAT,
       withAck(socket, (data) => {
         const user = requireRegistered(socket);
@@ -444,6 +577,34 @@ export function registerHandlers(nsp) {
 
       const presence = { ...data, userId, updatedAt: now() };
       socket.to(sessionRoom(session.code)).emit(EVENTS.PRESENCE_UPDATED, presence);
+    });
+
+    socket.on(EVENTS.REMOTE_COMMAND, (envelope) => {
+      const userId = socket.data.userId;
+      const data = envelope?.data;
+      if (!userId || !data?.sessionCode || !data?.type) return;
+      const session = sessions.get(data.sessionCode);
+      if (!session || session.status !== "active") return;
+      const participant = session.participants[userId];
+      if (!participant || participant.role !== "agent") return;
+      if (!(session.permissions ?? []).includes("ControlCoBrowsing")) return;
+
+      const command = {
+        ...data,
+        issuedByParticipantId: userId,
+        at: data.at ?? Date.now(),
+      };
+      nsp.to(userRoom(session.requesterId)).emit(EVENTS.REMOTE_COMMAND_RECEIVED, command);
+      emitLog(session, {
+        actorId: userId,
+        type: "remote_command",
+        message: `Comando remoto enviado (${command.type})`,
+        data: {
+          type: command.type,
+          targetSupportId: command.targetSupportId ?? null,
+          route: command.route,
+        },
+      });
     });
 
     socket.on(EVENTS.COBROWSING_EVENT, (envelope) => {

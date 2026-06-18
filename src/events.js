@@ -10,6 +10,11 @@ export const EVENTS = {
   SESSION_FINISH: "session:finish",
   PRESENCE_UPDATE: "presence:update",
   COBROWSING_EVENT: "cobrowsing:event",
+  PERMISSION_REQUEST: "permission:request",
+  PERMISSION_CANCEL: "permission:cancel",
+  PERMISSION_GRANT: "permission:grant",
+  PERMISSION_REVOKE: "permission:revoke",
+  REMOTE_COMMAND: "remote:command",
 
   // server -> client (broadcast)
   SUPPORT_BOOTSTRAP: "support:bootstrap",
@@ -24,6 +29,11 @@ export const EVENTS = {
   PRESENCE_UPDATED: "presence:updated",
   COBROWSING_EVENT_RECEIVED: "cobrowsing:event_received",
   LOG_APPENDED: "log:appended",
+  PERMISSION_REQUESTED: "permission:requested",
+  PERMISSION_GRANTED: "permission:granted",
+  PERMISSION_REVOKED: "permission:revoked",
+  PERMISSION_STATE: "permission:state",
+  REMOTE_COMMAND_RECEIVED: "remote:command_received",
 };
 
 export const NAMESPACE = "/remote-support";

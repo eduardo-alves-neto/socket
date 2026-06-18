@@ -24,11 +24,15 @@ Ack: `{ ok: boolean, data?: T, error?: { code, message, detail? } }`.
 |---|---|---|
 | `support:register` | `{ userId, name, email?, avatar?, permissions? }` | `{ user, bootstrap }` |
 | `support:agents:list` | — | `{ agents }` |
-| `ticket:create` | `{ agentId, mode: "assisted"\|"shared" }` | `{ ticket, session }` |
+| `ticket:create` | `{ agentIds? / agentId?, mode: "assisted" / "shared", permissions? }` | `{ ticket, tickets, session }` |
 | `ticket:accept` | `{ ticketId }` | `{ ticket, session }` |
 | `session:confirm` | `{ sessionCode, approved }` | `{ ticket, session }` |
 | `session:finish` | `{ sessionCode, reason }` | — |
 | `session:heartbeat` | `{ sessionCode }` | — |
+| `permission:request` | `{ sessionCode, permissions }` | `{ sessionCode, permissions, pendingPermissions }` |
+| `permission:cancel` | `{ sessionCode, permissions }` | `{ sessionCode, permissions, pendingPermissions }` |
+| `permission:grant` | `{ sessionCode, permissions }` | `{ sessionCode, permissions, pendingPermissions }` |
+| `permission:revoke` | `{ sessionCode, permissions }` | `{ sessionCode, permissions, pendingPermissions }` |
 
 ### Client → Server (fire-and-forget)
 
@@ -36,10 +40,11 @@ Ack: `{ ok: boolean, data?: T, error?: { code, message, detail? } }`.
 |---|---|
 | `presence:update` | `{ sessionCode, cursorX?, cursorY?, route?, scrollX?, scrollY?, ... }` |
 | `cobrowsing:event` | `{ sessionCode, type, payload? }` |
+| `remote:command` | `{ sessionCode, type, targetSupportId?, route?, scrollX?, scrollY?, value?, issuedByParticipantId?, at? }` |
 
 ### Server → Client
 
-`agents:list`, `ticket:created`, `ticket:accepted`, `session:approval_requested`, `session:active`, `session:finished`, `participant:joined`, `participant:left`, `presence:updated`, `cobrowsing:event_received`, `log:appended`.
+`agents:list`, `ticket:created`, `ticket:accepted`, `session:approval_requested`, `session:active`, `session:finished`, `participant:joined`, `participant:left`, `presence:updated`, `cobrowsing:event_received`, `log:appended`, `permission:requested`, `permission:granted`, `permission:revoked`, `permission:state`, `remote:command_received`.
 
 ## Fluxo
 
@@ -48,12 +53,14 @@ Ack: `{ ok: boolean, data?: T, error?: { code, message, detail? } }`.
 3. Atendente aceita (`ticket:accept`) → usuário recebe `session:approval_requested` (popup de confirmação).
 4. Usuário confirma (`session:confirm` com `approved: true`) → ambos entram na sala `session:{code}` e recebem `session:active`.
 5. Presence e eventos de co-browsing são retransmitidos só dentro da sala.
-6. Qualquer participante encerra com `session:finish` → `session:finished` para todos.
+6. Atendente solicita permissões com `permission:request`; usuário concede/revoga com `permission:grant`/`permission:revoke`; servidor emite `permission:state` como fonte da verdade.
+7. Com `ControlCoBrowsing` ativo, `remote:command` do atendente é entregue ao usuário como `remote:command_received`.
+8. Qualquer participante encerra com `session:finish` → `session:finished` para todos.
 
 ## Regras
 
 - Estado 100% em memória (reinício zera tudo).
-- Permissões vêm do payload de registro (frontend hoje envia mock).
+- Permissões de usuário vêm do payload de registro; permissões de sessão aceitas são `ViewCoBrowsing`, `ControlCoBrowsing` e `ShowRemotePointer`.
 - TTLs: ticket 5 min, aprovação 90 s, sessão com participante desconectado/sem heartbeat 2 min (sweeper a cada 15 s).
 - `scroll_changed` e `pointer_moved` não geram log (alta frequência); demais eventos viram `log:appended`.
 - Multi-tenant simples por `ContextCode` do handshake (`auth.ContextCode`): lista de atendentes é por contexto.

@@ -4,6 +4,58 @@ import { PERMISSIONS } from "./events.js";
 const MAX_SESSION_EVENTS = 200;
 const MAX_SESSION_LOGS = 200;
 
+export const SESSION_PERMISSIONS = [
+  "ViewCoBrowsing",
+  "ControlCoBrowsing",
+  "ShowRemotePointer",
+];
+
+const SESSION_PERMISSION_SET = new Set(SESSION_PERMISSIONS);
+const IMPLIES = {
+  ControlCoBrowsing: ["ViewCoBrowsing"],
+  ShowRemotePointer: ["ViewCoBrowsing"],
+};
+const DEPENDENTS = {
+  ViewCoBrowsing: ["ControlCoBrowsing", "ShowRemotePointer"],
+};
+
+export function isSessionPermission(permission) {
+  return SESSION_PERMISSION_SET.has(permission);
+}
+
+export function normalizeSessionPermissions(permissions = []) {
+  if (!Array.isArray(permissions)) return [];
+  return SESSION_PERMISSIONS.filter((permission) => permissions.includes(permission));
+}
+
+export function expandGrant(permissions = []) {
+  const normalized = normalizeSessionPermissions(permissions);
+  const result = new Set();
+  const visit = (permission) => {
+    if (result.has(permission)) return;
+    result.add(permission);
+    for (const implied of IMPLIES[permission] ?? []) visit(implied);
+  };
+  normalized.forEach(visit);
+  return SESSION_PERMISSIONS.filter((permission) => result.has(permission));
+}
+
+export function applyGrant(current = [], granted = []) {
+  return expandGrant([...normalizeSessionPermissions(current), ...normalizeSessionPermissions(granted)]);
+}
+
+export function applyRevoke(current = [], revoked = []) {
+  const normalized = normalizeSessionPermissions(current);
+  const toRemove = new Set();
+  const visit = (permission) => {
+    if (toRemove.has(permission)) return;
+    toRemove.add(permission);
+    for (const dependent of DEPENDENTS[permission] ?? []) visit(dependent);
+  };
+  normalizeSessionPermissions(revoked).forEach(visit);
+  return normalized.filter((permission) => !toRemove.has(permission));
+}
+
 // userId -> { id, contextCode, name, email, avatar, permissions: Set, sockets: Set<socketId> }
 export const users = new Map();
 // ticketId -> SupportTicket
@@ -71,7 +123,7 @@ export function createParticipant(userId, role) {
   };
 }
 
-export function createSessionWithTickets({ requesterId, agentIds, mode, ttlMs }) {
+export function createSessionWithTickets({ requesterId, agentIds, mode, ttlMs, permissions = [] }) {
   const ts = now();
   const sessionCode = randomUUID();
   const session = {
@@ -83,6 +135,8 @@ export function createSessionWithTickets({ requesterId, agentIds, mode, ttlMs })
     participants: { [requesterId]: createParticipant(requesterId, "requester") },
     cobrowsingEvents: [],
     logs: [],
+    permissions: applyGrant([], permissions),
+    pendingPermissions: [],
     createdAt: ts,
     updatedAt: ts,
   };
@@ -107,7 +161,7 @@ export function createSessionWithTickets({ requesterId, agentIds, mode, ttlMs })
   return { session, tickets: createdTickets };
 }
 
-export function createTicketWithSession({ requesterId, agentId, mode, ttlMs }) {
+export function createTicketWithSession({ requesterId, agentId, mode, ttlMs, permissions = [] }) {
   const ts = now();
   const ticket = {
     id: randomUUID(),
@@ -130,6 +184,8 @@ export function createTicketWithSession({ requesterId, agentId, mode, ttlMs }) {
     participants: { [requesterId]: createParticipant(requesterId, "requester") },
     cobrowsingEvents: [],
     logs: [],
+    permissions: applyGrant([], permissions),
+    pendingPermissions: [],
     createdAt: ts,
     updatedAt: ts,
   };

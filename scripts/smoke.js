@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { io } from "socket.io-client";
 
-const URL = process.env.URL ?? "http://localhost:8080";
+const URL = process.env.URL ?? "http://localhost:8081";
 const NAMESPACE = "/remote-support";
 const PATH = "/v1/remote-support/socket.io";
 
@@ -110,10 +110,57 @@ try {
   const cbEvent = await eventOnAgent;
   assert(cbEvent.type === "click", "cobrowsing retransmitido");
 
-  console.log("7. heartbeat");
+  console.log("7. permissões granulares");
+  const permissionRequestedOnUser = waitFor(user, "permission:requested");
+  const permissionStateOnAgent = waitFor(agent, "permission:state");
+  const requestedState = await emit(agent, "permission:request", {
+    sessionCode: ticket.sessionCode,
+    permissions: ["ControlCoBrowsing"],
+  });
+  assert(requestedState.pendingPermissions.includes("ControlCoBrowsing"), "permissão pendente");
+  const requested = await permissionRequestedOnUser;
+  assert(requested.permissions.includes("ControlCoBrowsing"), "request recebido pelo usuário");
+  await permissionStateOnAgent;
+
+  const permissionGrantedOnAgent = waitFor(agent, "permission:granted");
+  const grantedState = await emit(user, "permission:grant", {
+    sessionCode: ticket.sessionCode,
+    permissions: ["ControlCoBrowsing", "ViewCoBrowsing"],
+  });
+  assert(grantedState.permissions.includes("ControlCoBrowsing"), "controle concedido");
+  assert(grantedState.permissions.includes("ViewCoBrowsing"), "visualização auto-concedida");
+  const granted = await permissionGrantedOnAgent;
+  assert(granted.permissions.includes("ControlCoBrowsing"), "grant recebido pelo atendente");
+
+  console.log("8. comando remoto");
+  const remoteCommandOnUser = waitFor(user, "remote:command_received");
+  agent.emit("remote:command", {
+    operationTrace: randomUUID(),
+    data: {
+      sessionCode: ticket.sessionCode,
+      type: "remote.click",
+      targetSupportId: "button-save",
+      issuedByParticipantId: "agent-1",
+      at: Date.now(),
+    },
+  });
+  const command = await remoteCommandOnUser;
+  assert(command.type === "remote.click", "comando remoto retransmitido");
+  assert(command.issuedByParticipantId === "agent-1", "origem do comando preservada");
+
+  console.log("9. revogação de permissões");
+  const permissionRevokedOnAgent = waitFor(agent, "permission:revoked");
+  const revokedState = await emit(user, "permission:revoke", {
+    sessionCode: ticket.sessionCode,
+    permissions: ["ViewCoBrowsing"],
+  });
+  assert(!revokedState.permissions.includes("ControlCoBrowsing"), "controle revogado em cascata");
+  await permissionRevokedOnAgent;
+
+  console.log("10. heartbeat");
   await emit(user, "session:heartbeat", { sessionCode: ticket.sessionCode });
 
-  console.log("8. encerramento");
+  console.log("11. encerramento");
   const finishedOnUser = waitFor(user, "session:finished");
   await emit(agent, "session:finish", {
     sessionCode: ticket.sessionCode,

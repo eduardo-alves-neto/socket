@@ -5,7 +5,7 @@ import { Server } from "socket.io";
 import { NAMESPACE, SOCKET_PATH } from "./events.js";
 import { registerHandlers } from "./handlers.js";
 
-const PORT = Number(process.env.PORT ?? 8080);
+const PORT = Number(process.env.PORT ?? 8081);
 
 const CORS_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(",").map((o) => o.trim())
