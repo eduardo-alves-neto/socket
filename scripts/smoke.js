@@ -134,11 +134,25 @@ try {
     data: {
       sessionCode: ticket.sessionCode,
       type: "scroll_changed",
-      payload: { scrollX: 0, scrollY: 300, message: "Rolagem" },
+      payload: {
+        componentSupportId: "combo:list",
+        scrollElementPath: "data-slot:command-list:0",
+        scrollRatioX: 0,
+        scrollRatioY: 1,
+        scrollTarget: "element",
+        scrollX: 0,
+        scrollY: 300,
+        message: "Rolagem",
+      },
     },
   });
   const scrollEvent = await scrollEventOnAgent;
   assert(scrollEvent.type === "scroll_changed", "scroll_changed retransmitido");
+  assert(scrollEvent.payload?.componentSupportId === "combo:list", "componentSupportId preservado no scroll");
+  assert(scrollEvent.payload?.scrollElementPath === "data-slot:command-list:0", "scrollElementPath preservado");
+  assert(scrollEvent.payload?.scrollRatioX === 0, "scrollRatioX preservado");
+  assert(scrollEvent.payload?.scrollRatioY === 1, "scrollRatioY preservado");
+  assert(scrollEvent.payload?.scrollTarget === "element", "scrollTarget preservado");
   assert(scrollEvent.payload?.scrollY === 300, "scrollY preservado");
   assert(scrollEvent.payload?.route === undefined, "scroll_changed não carrega rota");
 
@@ -170,14 +184,26 @@ try {
     operationTrace: randomUUID(),
     data: {
       sessionCode: ticket.sessionCode,
-      type: "remote.click",
-      targetSupportId: "button-save",
+      type: "remote.scroll",
+      targetSupportId: "combo:list",
+      scrollElementPath: "data-slot:command-list:0",
+      scrollRatioX: 0,
+      scrollRatioY: 0.75,
+      scrollTarget: "element",
+      scrollX: 0,
+      scrollY: 300,
       issuedByParticipantId: "agent-1",
       at: Date.now(),
     },
   });
   const command = await remoteCommandOnUser;
-  assert(command.type === "remote.click", "comando remoto retransmitido");
+  assert(command.type === "remote.scroll", "comando remoto retransmitido");
+  assert(command.targetSupportId === "combo:list", "targetSupportId preservado no comando");
+  assert(command.scrollElementPath === "data-slot:command-list:0", "scrollElementPath preservado no comando");
+  assert(command.scrollRatioX === 0, "scrollRatioX preservado no comando");
+  assert(command.scrollRatioY === 0.75, "scrollRatioY preservado no comando");
+  assert(command.scrollTarget === "element", "scrollTarget preservado no comando");
+  assert(command.scrollY === 300, "scrollY preservado no comando");
   assert(command.issuedByParticipantId === "agent-1", "origem do comando preservada");
 
   console.log("9. revogação de permissões");

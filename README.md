@@ -40,7 +40,9 @@ Ack: `{ ok: boolean, data?: T, error?: { code, message, detail? } }`.
 |---|---|
 | `presence:update` | `{ sessionCode, cursorX?, cursorY?, route?, scrollX?, scrollY?, ... }` |
 | `cobrowsing:event` | `{ sessionCode, type, payload? }` |
-| `remote:command` | `{ sessionCode, type, targetSupportId?, route?, scrollX?, scrollY?, value?, issuedByParticipantId?, at? }` |
+| `remote:command` | `{ sessionCode, type, targetSupportId?, route?, scrollTarget?, scrollElementPath?, scrollRatioX?, scrollRatioY?, scrollX?, scrollY?, value?, issuedByParticipantId?, at? }` |
+
+Para scroll de containers internos, `payload` de `cobrowsing:event` e `remote:command` aceitam os campos opcionais `scrollTarget: "window" | "element"`, `scrollElementPath`, `componentSupportId`, `scrollRatioX`, `scrollRatioY`, `scrollX` e `scrollY`.
 
 ### Server → Client
 
