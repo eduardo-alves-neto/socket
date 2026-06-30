@@ -9,7 +9,7 @@ const PORT = Number(process.env.PORT ?? 8081);
 
 const CORS_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(",").map((o) => o.trim())
-  : ["http://localhost:3000", "http://localhost:5173"];
+  : ["http://localhost:3000", "http://localhost:5173", "*"];
 
 const app = express();
 
