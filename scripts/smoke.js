@@ -1,4 +1,4 @@
-// Smoke test: simula fluxo completo usuário + atendente contra o servidor local.
+// Smoke test: simula o fluxo completo de lobby multi-atendente contra o servidor local.
 // Uso: inicie o servidor (npm start) e rode `npm run smoke`.
 import { randomUUID } from "node:crypto";
 import { io } from "socket.io-client";
@@ -48,7 +48,9 @@ const fail = (msg) => {
 const assert = (cond, msg) => !cond && fail(msg);
 
 const user = connect("user");
-const agent = connect("agent");
+const agentB = connect("agentB");
+const agentC = connect("agentC");
+const agentD = connect("agentD");
 
 try {
   console.log("1. registro");
@@ -59,178 +61,161 @@ try {
   });
   assert(userReg.user.id === "user-1", "registro do usuário");
 
-  const agentReg = await emit(agent, "support:register", {
-    userId: "agent-1",
-    name: "Suporte Teste",
-    permissions: ["remote-support.agent"],
-  });
-  assert(agentReg.user.id === "agent-1", "registro do atendente");
+  for (const [socket, id, name] of [
+    [agentB, "agent-b", "Atendente B"],
+    [agentC, "agent-c", "Atendente C"],
+    [agentD, "agent-d", "Atendente D"],
+  ]) {
+    const reg = await emit(socket, "support:register", { userId: id, name, permissions: ["remote-support.agent"] });
+    assert(reg.user.id === id, `registro de ${id}`);
+  }
 
   console.log("2. lista de atendentes");
   const { agents } = await emit(user, "support:agents:list");
-  assert(agents.some((a) => a.id === "agent-1" && a.online), "atendente online na lista");
+  assert(["agent-b", "agent-c"].every((id) => agents.some((a) => a.id === id && a.online)), "atendentes online na lista");
 
-  console.log("3. criação do chamado");
-  const ticketCreatedOnAgent = waitFor(agent, "ticket:created");
-  const { ticket } = await emit(user, "ticket:create", { agentId: "agent-1", mode: "shared" });
-  assert(ticket.status === "requested", "ticket requested");
-  await ticketCreatedOnAgent;
-
-  console.log("4. aceite pelo atendente");
-  const approvalRequested = waitFor(user, "session:approval_requested");
-  const accepted = await emit(agent, "ticket:accept", { ticketId: ticket.id });
-  assert(accepted.ticket.status === "waiting_user_approval", "ticket waiting_user_approval");
-  const approval = await approvalRequested;
-  assert(approval.session.code === ticket.sessionCode, "approval traz sessionCode");
-
-  console.log("5. confirmação pelo usuário");
-  const sessionActiveOnAgent = waitFor(agent, "session:active");
-  const confirmed = await emit(user, "session:confirm", {
-    sessionCode: ticket.sessionCode,
-    approved: true,
+  console.log("3. criação da sala + convites para B e C");
+  const inviteReceivedB = waitFor(agentB, "invite:received");
+  const inviteReceivedC = waitFor(agentC, "invite:received");
+  const { room, invites } = await emit(user, "room:create", {
+    agentIds: ["agent-b", "agent-c"],
+    mode: "shared",
   });
-  assert(confirmed.session.status === "active", "sessão ativa");
-  assert(Object.keys(confirmed.session.participants).length === 2, "dois participantes");
-  await sessionActiveOnAgent;
+  assert(room.status === "open", "sala aberta imediatamente");
+  assert(room.ownerId === "user-1", "dono da sala é o usuário");
+  assert(invites.length === 2, "dois convites criados");
+  assert(invites.every((i) => i.status === "pending"), "convites pendentes");
+  await inviteReceivedB;
+  await inviteReceivedC;
 
-  console.log("6. presence + cobrowsing");
-  const presenceOnAgent = waitFor(agent, "presence:updated");
+  console.log("4. B recusa o convite");
+  const inviteUpdatedOnUserB = waitFor(user, "invite:updated");
+  const inviteB = invites.find((i) => i.agentId === "agent-b");
+  const declined = await emit(agentB, "invite:decline", { inviteId: inviteB.id });
+  assert(declined.invite.status === "declined", "convite de B recusado");
+  const declinedNotice = await inviteUpdatedOnUserB;
+  assert(declinedNotice.invite.status === "declined", "usuário notificado da recusa");
+
+  console.log("5. C aceita, dono aprova");
+  const ownerApprovalRequested = waitFor(user, "owner:approval_requested");
+  const inviteC = invites.find((i) => i.agentId === "agent-c");
+  const acceptedC = await emit(agentC, "invite:accept", { inviteId: inviteC.id });
+  assert(acceptedC.invite.status === "awaiting_owner_approval", "convite de C aguardando aprovação");
+  const approvalReq = await ownerApprovalRequested;
+  assert(approvalReq.invite.id === inviteC.id, "aprovação referencia o convite de C");
+
+  const participantJoinedOnC = waitFor(agentC, "participant:joined");
+  const approvedC = await emit(user, "invite:approve", { inviteId: inviteC.id, approved: true });
+  assert(approvedC.invite.status === "joined", "C entrou na sala");
+  assert(Object.keys(approvedC.room.participants).length === 2, "dois participantes (user + C)");
+  await participantJoinedOnC;
+
+  console.log("5b. presence + cobrowsing dentro da sala");
+  const presenceOnC = waitFor(agentC, "presence:updated");
   user.emit("presence:update", {
     operationTrace: randomUUID(),
-    data: { sessionCode: ticket.sessionCode, cursorX: 0.5, cursorY: 0.3, route: "/home" },
+    data: { roomCode: room.code, cursorX: 0.5, cursorY: 0.3, route: "/home" },
   });
-  const presence = await presenceOnAgent;
+  const presence = await presenceOnC;
   assert(presence.userId === "user-1" && presence.cursorX === 0.5, "presence retransmitida");
 
-  const eventOnAgent = waitFor(agent, "cobrowsing:event_received");
+  const eventOnC = waitFor(agentC, "cobrowsing:event_received");
   user.emit("cobrowsing:event", {
     operationTrace: randomUUID(),
-    data: { sessionCode: ticket.sessionCode, type: "click", payload: { x: 10, y: 20 } },
+    data: { roomCode: room.code, type: "click", payload: { x: 10, y: 20 } },
   });
-  const cbEvent = await eventOnAgent;
+  const cbEvent = await eventOnC;
   assert(cbEvent.type === "click", "cobrowsing retransmitido");
 
-  console.log("6b. cobrowsing route_changed (base do seguimento de rota do agente)");
-  const routeEventOnAgent = waitFor(agent, "cobrowsing:event_received");
-  user.emit("cobrowsing:event", {
-    operationTrace: randomUUID(),
-    data: {
-      sessionCode: ticket.sessionCode,
-      type: "route_changed",
-      payload: { route: "/clientes", message: "Navegou para /clientes" },
-    },
-  });
-  const routeEvent = await routeEventOnAgent;
-  assert(routeEvent.type === "route_changed", "route_changed retransmitido");
-  assert(routeEvent.payload?.route === "/clientes", "rota preservada no payload");
-  assert(routeEvent.userId === "user-1", "userId do emissor preservado");
-  assert(typeof routeEvent.id === "string", "evento tem id gerado");
-  assert(typeof routeEvent.createdAt === "string", "evento tem createdAt");
+  console.log("6. sala ativa aceita convite dinâmico (D) mesmo já com C dentro");
+  const inviteReceivedD = waitFor(agentD, "invite:received");
+  const { invites: invitesRound2 } = await emit(user, "room:invite", { roomCode: room.code, agentIds: ["agent-d"] });
+  assert(invitesRound2.length === 1, "convite dinâmico criado para D");
+  await inviteReceivedD;
 
-  console.log("6c. cobrowsing scroll_changed (sem rota — não dispara navegação)");
-  const scrollEventOnAgent = waitFor(agent, "cobrowsing:event_received");
-  user.emit("cobrowsing:event", {
-    operationTrace: randomUUID(),
-    data: {
-      sessionCode: ticket.sessionCode,
-      type: "scroll_changed",
-      payload: {
-        componentSupportId: "combo:list",
-        scrollElementPath: "data-slot:command-list:0",
-        scrollRatioX: 0,
-        scrollRatioY: 1,
-        scrollTarget: "element",
-        scrollX: 0,
-        scrollY: 300,
-        message: "Rolagem",
-      },
-    },
-  });
-  const scrollEvent = await scrollEventOnAgent;
-  assert(scrollEvent.type === "scroll_changed", "scroll_changed retransmitido");
-  assert(scrollEvent.payload?.componentSupportId === "combo:list", "componentSupportId preservado no scroll");
-  assert(scrollEvent.payload?.scrollElementPath === "data-slot:command-list:0", "scrollElementPath preservado");
-  assert(scrollEvent.payload?.scrollRatioX === 0, "scrollRatioX preservado");
-  assert(scrollEvent.payload?.scrollRatioY === 1, "scrollRatioY preservado");
-  assert(scrollEvent.payload?.scrollTarget === "element", "scrollTarget preservado");
-  assert(scrollEvent.payload?.scrollY === 300, "scrollY preservado");
-  assert(scrollEvent.payload?.route === undefined, "scroll_changed não carrega rota");
+  const ownerApprovalRequestedD = waitFor(user, "owner:approval_requested");
+  const inviteD = invitesRound2[0];
+  await emit(agentD, "invite:accept", { inviteId: inviteD.id });
+  await ownerApprovalRequestedD;
+  const participantJoinedOnD = waitFor(agentC, "participant:joined");
+  const approvedD = await emit(user, "invite:approve", { inviteId: inviteD.id, approved: true });
+  assert(Object.keys(approvedD.room.participants).length === 3, "três participantes (user + C + D)");
+  await participantJoinedOnD;
 
   console.log("7. permissões granulares");
-  const permissionRequestedOnUser = waitFor(user, "permission:requested");
-  const permissionStateOnAgent = waitFor(agent, "permission:state");
-  const requestedState = await emit(agent, "permission:request", {
-    sessionCode: ticket.sessionCode,
+  const permissionGrantedOnC = waitFor(agentC, "permission:granted");
+  const grantedState = await emit(user, "permission:grant", {
+    roomCode: room.code,
     permissions: ["ControlCoBrowsing"],
   });
-  assert(requestedState.pendingPermissions.includes("ControlCoBrowsing"), "permissão pendente");
-  const requested = await permissionRequestedOnUser;
-  assert(requested.permissions.includes("ControlCoBrowsing"), "request recebido pelo usuário");
-  await permissionStateOnAgent;
-
-  const permissionGrantedOnAgent = waitFor(agent, "permission:granted");
-  const grantedState = await emit(user, "permission:grant", {
-    sessionCode: ticket.sessionCode,
-    permissions: ["ControlCoBrowsing", "ViewCoBrowsing"],
-  });
   assert(grantedState.permissions.includes("ControlCoBrowsing"), "controle concedido");
-  assert(grantedState.permissions.includes("ViewCoBrowsing"), "visualização auto-concedida");
-  const granted = await permissionGrantedOnAgent;
-  assert(granted.permissions.includes("ControlCoBrowsing"), "grant recebido pelo atendente");
+  await permissionGrantedOnC;
 
-  console.log("8. comando remoto");
+  console.log("8. piloto único: C assume, D não consegue mandar comando, C libera, D assume");
+  const driverChangedToC = waitFor(agentD, "driver:changed");
+  const claimC = await emit(agentC, "driver:claim", { roomCode: room.code });
+  assert(claimC.driverId === "agent-c", "C é o piloto");
+  await driverChangedToC;
+
   const remoteCommandOnUser = waitFor(user, "remote:command_received");
-  agent.emit("remote:command", {
+  agentC.emit("remote:command", {
     operationTrace: randomUUID(),
-    data: {
-      sessionCode: ticket.sessionCode,
-      type: "remote.scroll",
-      targetSupportId: "combo:list",
-      scrollElementPath: "data-slot:command-list:0",
-      scrollRatioX: 0,
-      scrollRatioY: 0.75,
-      scrollTarget: "element",
-      scrollX: 0,
-      scrollY: 300,
-      issuedByParticipantId: "agent-1",
-      at: Date.now(),
-    },
+    data: { roomCode: room.code, type: "remote.click", targetSupportId: "btn-1", issuedByParticipantId: "agent-c", at: Date.now() },
   });
   const command = await remoteCommandOnUser;
-  assert(command.type === "remote.scroll", "comando remoto retransmitido");
-  assert(command.targetSupportId === "combo:list", "targetSupportId preservado no comando");
-  assert(command.scrollElementPath === "data-slot:command-list:0", "scrollElementPath preservado no comando");
-  assert(command.scrollRatioX === 0, "scrollRatioX preservado no comando");
-  assert(command.scrollRatioY === 0.75, "scrollRatioY preservado no comando");
-  assert(command.scrollTarget === "element", "scrollTarget preservado no comando");
-  assert(command.scrollY === 300, "scrollY preservado no comando");
-  assert(command.issuedByParticipantId === "agent-1", "origem do comando preservada");
+  assert(command.issuedByParticipantId === "agent-c", "comando do piloto chega ao usuário");
 
-  console.log("9. revogação de permissões");
-  const permissionRevokedOnAgent = waitFor(agent, "permission:revoked");
-  const revokedState = await emit(user, "permission:revoke", {
-    sessionCode: ticket.sessionCode,
-    permissions: ["ViewCoBrowsing"],
+  let dBlocked = true;
+  user.once("remote:command_received", () => {
+    dBlocked = false;
   });
-  assert(!revokedState.permissions.includes("ControlCoBrowsing"), "controle revogado em cascata");
-  await permissionRevokedOnAgent;
+  agentD.emit("remote:command", {
+    operationTrace: randomUUID(),
+    data: { roomCode: room.code, type: "remote.click", targetSupportId: "btn-2", issuedByParticipantId: "agent-d", at: Date.now() },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert(dBlocked, "D não é piloto — comando descartado silenciosamente");
+
+  const driverChangedToNull = waitFor(agentD, "driver:changed");
+  const releaseC = await emit(agentC, "driver:release", { roomCode: room.code });
+  assert(releaseC.driverId === null, "C liberou o controle");
+  await driverChangedToNull;
+
+  const claimD = await emit(agentD, "driver:claim", { roomCode: room.code });
+  assert(claimD.driverId === "agent-d", "D assume o controle após C liberar");
+
+  console.log("8b. revogar ControlCoBrowsing derruba o piloto atual (D)");
+  const driverChangedToNullOnRevoke = waitFor(agentD, "driver:changed");
+  const revokedState = await emit(user, "permission:revoke", {
+    roomCode: room.code,
+    permissions: ["ControlCoBrowsing"],
+  });
+  assert(!revokedState.permissions.includes("ControlCoBrowsing"), "controle revogado");
+  const revokeNotice = await driverChangedToNullOnRevoke;
+  assert(revokeNotice.driverId === null, "piloto liberado ao revogar permissão");
+
+  console.log("9. C sai da sala — sala continua para user e D");
+  const participantLeftOnD = waitFor(agentD, "participant:left");
+  await emit(agentC, "room:leave", { roomCode: room.code });
+  const leftNotice = await participantLeftOnD;
+  assert(leftNotice.userId === "agent-c", "notificação de saída de C");
 
   console.log("10. heartbeat");
-  await emit(user, "session:heartbeat", { sessionCode: ticket.sessionCode });
+  await emit(user, "room:heartbeat", { roomCode: room.code });
 
-  console.log("11. encerramento");
-  const finishedOnUser = waitFor(user, "session:finished");
-  await emit(agent, "session:finish", {
-    sessionCode: ticket.sessionCode,
-    reason: "support_agent_finished",
-  });
-  await finishedOnUser;
+  console.log("11. dono encerra a sala — todos recebem room:closed");
+  const roomClosedOnD = waitFor(agentD, "room:closed");
+  await emit(user, "room:close", { roomCode: room.code });
+  const closedPayload = await roomClosedOnD;
+  assert(closedPayload.room.status === "closed", "sala encerrada");
 
-  console.log("\nSMOKE OK — fluxo completo funcionou.");
+  console.log("\nSMOKE OK — fluxo completo de lobby multi-atendente funcionou.");
   process.exit(0);
 } catch (error) {
   fail(error.message);
 } finally {
   user.close();
-  agent.close();
+  agentB.close();
+  agentC.close();
+  agentD.close();
 }

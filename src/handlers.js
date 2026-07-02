@@ -6,24 +6,29 @@ import {
   appendCobrowsingEvent,
   appendLog,
   buildBootstrap,
+  clearDriver,
   clearTimer,
-  createParticipant,
-  createSessionWithTickets,
+  createInvite,
+  createRoom,
+  invites,
   isAgent,
-  isOpenTicket,
+  isOpenInvite,
+  joinParticipant,
+  leaveParticipant,
   listAgents,
   normalizeSessionPermissions,
   now,
-  sessions,
+  rooms,
+  setDriver,
   setTimer,
-  tickets,
   toAgent,
+  touch,
   upsertUser,
   users,
 } from "./state.js";
 
 const userRoom = (userId) => `user:${userId}`;
-const sessionRoom = (code) => `session:${code}`;
+const roomRoom = (code) => `room:${code}`;
 const contextRoom = (contextCode) => `ctx:${contextCode}`;
 
 // Envolve handler: extrai data do envelope, responde ack { ok, data?, error? }.
@@ -47,12 +52,16 @@ function requireRegistered(socket) {
   return user;
 }
 
-function getSession(sessionCode) {
-  const session = sessions.get(sessionCode);
-  if (!session) throw new SupportError("SESSION_NOT_FOUND", "Sessão não encontrada");
-  session.permissions ??= [];
-  session.pendingPermissions ??= [];
-  return session;
+function getRoom(roomCode) {
+  const room = rooms.get(roomCode);
+  if (!room) throw new SupportError("ROOM_NOT_FOUND", "Sala não encontrada");
+  return room;
+}
+
+function getInvite(inviteId) {
+  const invite = invites.get(inviteId);
+  if (!invite) throw new SupportError("INVITE_NOT_FOUND", "Convite não encontrado");
+  return invite;
 }
 
 function parseSessionPermissions(value) {
@@ -64,14 +73,27 @@ function parseSessionPermissions(value) {
   return permissions;
 }
 
-function requireActiveParticipant(socket, sessionCode) {
+function requireOpenRoomParticipant(socket, roomCode) {
   const user = requireRegistered(socket);
-  const session = getSession(sessionCode);
-  if (session.status !== "active")
-    throw new SupportError("INVALID_STATE", `Sessão em estado inválido: ${session.status}`);
-  const participant = session.participants[user.id];
-  if (!participant) throw new SupportError("FORBIDDEN", "Usuário não participa desta sessão");
-  return { user, session, participant };
+  const room = getRoom(roomCode);
+  if (room.status !== "open")
+    throw new SupportError("INVALID_STATE", `Sala em estado inválido: ${room.status}`);
+  const participant = room.participants[user.id];
+  if (!participant) throw new SupportError("FORBIDDEN", "Usuário não participa desta sala");
+  return { user, room, participant };
+}
+
+function resolveAgents(rawIds, requester) {
+  const agentIds = [...new Set(rawIds)];
+  if (!agentIds.length) throw new SupportError("INVALID_PAYLOAD", "agentIds é obrigatório");
+  return agentIds.map((id) => {
+    const a = users.get(id);
+    if (!a || !isAgent(a))
+      throw new SupportError("AGENT_NOT_FOUND", `Atendente não encontrado: ${id}`);
+    if (a.id === requester.id)
+      throw new SupportError("INVALID_PAYLOAD", "Não é possível convidar a si mesmo");
+    return a;
+  });
 }
 
 export function registerHandlers(nsp) {
@@ -79,104 +101,69 @@ export function registerHandlers(nsp) {
     nsp.to(contextRoom(contextCode)).emit(EVENTS.AGENTS_LIST, listAgents(contextCode));
   }
 
-  function emitLog(session, entry) {
-    const log = appendLog(session, entry);
-    nsp.to(sessionRoom(session.code)).emit(EVENTS.LOG_APPENDED, log);
+  function emitLog(room, entry) {
+    const log = appendLog(room, entry);
+    nsp.to(roomRoom(room.code)).emit(EVENTS.LOG_APPENDED, log);
     return log;
   }
 
-  function permissionState(session) {
+  function permissionState(room) {
     return {
-      sessionCode: session.code,
-      permissions: session.permissions ?? [],
-      pendingPermissions: session.pendingPermissions ?? [],
+      roomCode: room.code,
+      permissions: room.permissions ?? [],
+      pendingPermissions: room.pendingPermissions ?? [],
     };
   }
 
-  function emitPermissionState(session) {
-    nsp.to(sessionRoom(session.code)).emit(EVENTS.PERMISSION_STATE, permissionState(session));
+  function emitPermissionState(room) {
+    nsp.to(roomRoom(room.code)).emit(EVENTS.PERMISSION_STATE, permissionState(room));
   }
 
-  function touch(...records) {
-    const ts = now();
-    for (const record of records) record.updatedAt = ts;
-  }
-
-  function finishSession(session, reason, actorId) {
-    if (session.status === "finished" || session.status === "expired") return;
-
-    const terminalStatus = reason === "expired" ? "expired" : "finished";
-
-    // Encerra todos os tickets abertos desta sessão
-    for (const ticket of tickets.values()) {
-      if (ticket.sessionCode === session.code && isOpenTicket(ticket)) {
-        clearTimer(ticket.id);
-        ticket.status = terminalStatus;
-        ticket.finishedAt = now();
-        ticket.finishReason = reason;
-        touch(ticket);
-      }
+  function cancelOpenInvitesForRoom(room, reason, actorId) {
+    for (const invite of invites.values()) {
+      if (invite.roomCode !== room.code || !isOpenInvite(invite)) continue;
+      clearTimer(invite.id);
+      invite.status = "cancelled";
+      invite.finishedAt = now();
+      invite.finishReason = reason;
+      touch(invite);
+      nsp.to(userRoom(invite.agentId)).emit(EVENTS.INVITE_UPDATED, { invite });
     }
+  }
 
-    session.status = terminalStatus;
-    session.finishedAt = now();
-    session.finishReason = reason;
-    touch(session);
+  function closeRoom(room, reason, actorId) {
+    if (room.status !== "open") return;
 
-    emitLog(session, {
+    room.status = reason === "expired" ? "expired" : "closed";
+    room.closedAt = now();
+    room.closeReason = reason;
+    touch(room);
+
+    cancelOpenInvitesForRoom(room, reason === "expired" ? "room_expired" : "room_closed", actorId);
+
+    emitLog(room, {
       actorId,
-      type: "session_finished",
-      message: `Atendimento encerrado (${reason})`,
+      type: "room_closed",
+      message: `Sala encerrada (${reason})`,
     });
 
-    const payload = { session };
-    // Notifica via sala da sessão (participantes ativos) + diretamente ao solicitante e agentes
-    nsp.to(sessionRoom(session.code)).emit(EVENTS.SESSION_FINISHED, payload);
-    nsp.to(userRoom(session.requesterId)).emit(EVENTS.SESSION_FINISHED, payload);
-    for (const [userId, p] of Object.entries(session.participants)) {
-      if (p.role === "agent") nsp.to(userRoom(userId)).emit(EVENTS.SESSION_FINISHED, payload);
+    const payload = { room };
+    nsp.to(roomRoom(room.code)).emit(EVENTS.ROOM_CLOSED, payload);
+    for (const userId of Object.keys(room.participants)) {
+      nsp.to(userRoom(userId)).emit(EVENTS.ROOM_CLOSED, payload);
     }
-    nsp.socketsLeave(sessionRoom(session.code));
+    nsp.socketsLeave(roomRoom(room.code));
   }
 
-  function rejectTicket(ticket, session, status, reason, actorId) {
-    clearTimer(ticket.id);
-    ticket.status = status;
-    ticket.finishedAt = now();
-    ticket.finishReason = reason;
-    touch(ticket);
-
-    appendLog(session, {
-      actorId,
-      type: "ticket_closed",
-      message: `Chamado encerrado (${reason})`,
-    });
-
-    // Verifica se há outros tickets ainda abertos nesta sessão
-    const otherOpen = [...tickets.values()].some(
-      (t) => t.id !== ticket.id && t.sessionCode === session.code && isOpenTicket(t),
-    );
-
-    // Notifica o agente deste ticket
-    if (ticket.agentId) {
-      nsp.to(userRoom(ticket.agentId)).emit(EVENTS.SESSION_FINISHED, { ticket, session });
-    }
-
-    // Só encerra a sessão quando não houver mais tickets abertos
-    if (!otherOpen) {
-      finishSession(session, reason, actorId);
-    }
-  }
-
-  // Sweeper: encerra sessões ativas cujo participante está sem heartbeat/desconectado há muito tempo.
+  // Sweeper: fecha salas cujo DONO está sem heartbeat/desconectado há muito tempo.
+  // Atendentes desconectados não derrubam a sala — só ficam marcados como offline.
   const sweeper = setInterval(() => {
-    const cutoff = Date.now() - TTL.SESSION_STALE_MS;
-    for (const session of sessions.values()) {
-      if (session.status !== "active") continue;
-      const stale = Object.values(session.participants).some(
-        (p) => !p.connected && Date.parse(p.lastHeartbeatAt) < cutoff,
-      );
-      if (stale) finishSession(session, "expired");
+    const cutoff = Date.now() - TTL.ROOM_STALE_MS;
+    for (const room of rooms.values()) {
+      if (room.status !== "open") continue;
+      const owner = room.participants[room.ownerId];
+      const stale = !owner || (!owner.connected && Date.parse(owner.lastHeartbeatAt) < cutoff);
+      if (stale) closeRoom(room, "expired", room.ownerId);
     }
   }, TTL.SWEEP_INTERVAL_MS);
   sweeper.unref?.();
@@ -197,14 +184,14 @@ export function registerHandlers(nsp) {
         socket.join(userRoom(user.id));
         socket.join(contextRoom(contextCode));
 
-        // Reconecta em sessões ativas das quais participa.
-        for (const session of sessions.values()) {
-          const participant = session.participants[user.id];
-          if (session.status !== "active" || !participant) continue;
-          socket.join(sessionRoom(session.code));
+        // Reconecta em salas abertas das quais participa.
+        for (const room of rooms.values()) {
+          const participant = room.participants[user.id];
+          if (room.status !== "open" || !participant) continue;
+          socket.join(roomRoom(room.code));
           participant.connected = true;
           participant.lastHeartbeatAt = now();
-          socket.to(sessionRoom(session.code)).emit(EVENTS.PARTICIPANT_JOINED, participant);
+          socket.to(roomRoom(room.code)).emit(EVENTS.PARTICIPANT_JOINED, participant);
         }
 
         broadcastAgents(contextCode);
@@ -221,344 +208,333 @@ export function registerHandlers(nsp) {
     );
 
     socket.on(
-      EVENTS.TICKET_CREATE,
-      withAck(socket, (data) => {
+      EVENTS.ROOM_CREATE,
+      withAck(socket, async (data) => {
         const requester = requireRegistered(socket);
         if (!requester.permissions.has(PERMISSIONS.REQUEST))
           throw new SupportError("FORBIDDEN", "Sem permissão para solicitar suporte");
+        if (!["assisted", "shared"].includes(data.mode))
+          throw new SupportError("INVALID_PAYLOAD", "mode é obrigatório");
 
-        const rawIds = Array.isArray(data.agentIds)
-          ? data.agentIds
-          : data.agentId
-            ? [data.agentId]
-            : [];
-        if (!rawIds.length || !["assisted", "shared"].includes(data.mode))
-          throw new SupportError("INVALID_PAYLOAD", "agentIds e mode são obrigatórios");
-
-        const agentIds = [...new Set(rawIds)];
-        const agentUsers = agentIds.map((id) => {
-          const a = users.get(id);
-          if (!a || !isAgent(a))
-            throw new SupportError("AGENT_NOT_FOUND", `Atendente não encontrado: ${id}`);
-          if (a.id === requester.id)
-            throw new SupportError("INVALID_PAYLOAD", "Não é possível solicitar suporte a si mesmo");
-          return a;
-        });
-
-        const existingBlocking = [...tickets.values()].find(
-          (t) =>
-            (t.status === "waiting_user_approval" || t.status === "active") &&
-            t.requesterId === requester.id,
+        const alreadyOwnsRoom = [...rooms.values()].some(
+          (r) => r.status === "open" && r.ownerId === requester.id,
         );
-        if (existingBlocking)
-          throw new SupportError(
-            "ALREADY_HAS_OPEN_TICKET",
-            "Você já possui um atendimento em andamento",
-          );
+        if (alreadyOwnsRoom)
+          throw new SupportError("ALREADY_HAS_OPEN_ROOM", "Você já possui uma sala aberta");
 
-        const { session, tickets: createdTickets } = createSessionWithTickets({
-          requesterId: requester.id,
-          agentIds,
+        const rawIds = Array.isArray(data.agentIds) ? data.agentIds : [];
+        const agentUsers = resolveAgents(rawIds, requester);
+
+        const room = createRoom({
+          ownerId: requester.id,
           mode: data.mode,
-          ttlMs: TTL.TICKET_MS,
           permissions: parseSessionPermissions(data.permissions),
         });
+        const ownerSockets = await nsp.in(userRoom(requester.id)).fetchSockets();
+        for (const s of ownerSockets) s.join(roomRoom(room.code));
 
-        appendLog(session, {
-          actorId: requester.id,
-          type: "ticket_created",
-          message: `${requester.name} solicitou suporte para ${agentUsers.length} atendente(s) (${data.mode})`,
+        const createdInvites = agentUsers.map((agentUser) => {
+          const invite = createInvite({
+            roomCode: room.code,
+            requesterId: requester.id,
+            agentId: agentUser.id,
+            mode: data.mode,
+            ttlMs: TTL.INVITE_MS,
+          });
+          nsp.to(userRoom(agentUser.id)).emit(EVENTS.INVITE_RECEIVED, { invite, room });
+          setTimer(
+            invite.id,
+            () => {
+              if (invite.status === "pending") {
+                clearTimer(invite.id);
+                invite.status = "expired";
+                invite.finishedAt = now();
+                invite.finishReason = "expired";
+                touch(invite);
+                nsp.to(userRoom(invite.agentId)).emit(EVENTS.INVITE_UPDATED, { invite });
+                nsp.to(userRoom(room.ownerId)).emit(EVENTS.INVITE_UPDATED, { invite });
+              }
+            },
+            TTL.INVITE_MS,
+          );
+          return invite;
         });
 
-        for (let i = 0; i < agentUsers.length; i++) {
-          const agentTicket = createdTickets[i];
-          nsp.to(userRoom(agentUsers[i].id)).emit(EVENTS.TICKET_CREATED, { ticket: agentTicket, session });
-          setTimer(
-            agentTicket.id,
-            () => {
-              if (agentTicket.status === "requested")
-                rejectTicket(agentTicket, session, "expired", "expired");
-            },
-            TTL.TICKET_MS,
-          );
-        }
+        emitLog(room, {
+          actorId: requester.id,
+          type: "room_created",
+          message: `${requester.name} criou a sala e convidou ${agentUsers.length} atendente(s) (${data.mode})`,
+        });
 
-        return { ticket: createdTickets[0], tickets: createdTickets, session };
+        return { room, invites: createdInvites };
       }),
     );
 
     socket.on(
-      EVENTS.TICKET_ACCEPT,
-      withAck(socket, async (data) => {
-        const agent = requireRegistered(socket);
-        const ticket = tickets.get(data.ticketId);
-        if (!ticket) throw new SupportError("TICKET_NOT_FOUND", "Chamado não encontrado");
-        if (ticket.agentId !== agent.id)
-          throw new SupportError("FORBIDDEN", "Chamado atribuído a outro atendente");
-        if (ticket.status !== "requested")
-          throw new SupportError("INVALID_STATE", `Chamado em estado inválido: ${ticket.status}`);
+      EVENTS.ROOM_INVITE,
+      withAck(socket, (data) => {
+        const requester = requireRegistered(socket);
+        const room = getRoom(data.roomCode);
+        if (room.status !== "open")
+          throw new SupportError("INVALID_STATE", `Sala em estado inválido: ${room.status}`);
+        if (room.ownerId !== requester.id)
+          throw new SupportError("FORBIDDEN", "Apenas o dono da sala pode convidar atendentes");
 
-        const session = getSession(ticket.sessionCode);
-        ticket.status = "waiting_user_approval";
-        ticket.acceptedAt = now();
-        ticket.approvalExpiresAt = new Date(Date.now() + TTL.APPROVAL_MS).toISOString();
-        touch(ticket);
+        const rawIds = Array.isArray(data.agentIds) ? data.agentIds : [];
+        const agentUsers = resolveAgents(rawIds, requester);
 
-        // Adiciona agente como participante da sessão compartilhada
-        if (!session.participants[agent.id]) {
-          session.participants[agent.id] = createParticipant(agent.id, "agent");
-        }
+        const existingOpenAgentIds = new Set(
+          [...invites.values()]
+            .filter((i) => i.roomCode === room.code && isOpenInvite(i))
+            .map((i) => i.agentId),
+        );
 
-        appendLog(session, {
-          actorId: agent.id,
-          type: "ticket_accepted",
-          message: `${agent.name} aceitou o chamado`,
+        const createdInvites = agentUsers
+          .filter((agentUser) => {
+            if (room.participants[agentUser.id]) return false;
+            if (existingOpenAgentIds.has(agentUser.id)) return false;
+            return true;
+          })
+          .map((agentUser) => {
+            const invite = createInvite({
+              roomCode: room.code,
+              requesterId: requester.id,
+              agentId: agentUser.id,
+              mode: room.mode,
+              ttlMs: TTL.INVITE_MS,
+            });
+            nsp.to(userRoom(agentUser.id)).emit(EVENTS.INVITE_RECEIVED, { invite, room });
+            setTimer(
+              invite.id,
+              () => {
+                if (invite.status === "pending") {
+                  clearTimer(invite.id);
+                  invite.status = "expired";
+                  invite.finishedAt = now();
+                  invite.finishReason = "expired";
+                  touch(invite);
+                  nsp.to(userRoom(invite.agentId)).emit(EVENTS.INVITE_UPDATED, { invite });
+                  nsp.to(userRoom(room.ownerId)).emit(EVENTS.INVITE_UPDATED, { invite });
+                }
+              },
+              TTL.INVITE_MS,
+            );
+            return invite;
+          });
+
+        emitLog(room, {
+          actorId: requester.id,
+          type: "room_invited",
+          message: `${requester.name} convidou ${createdInvites.length} atendente(s) adicional(is)`,
         });
 
-        const payload = { ticket, session };
-        nsp.to(userRoom(agent.id)).emit(EVENTS.TICKET_ACCEPTED, payload);
+        return { room, invites: createdInvites };
+      }),
+    );
 
-        if (session.status === "requested") {
-          // Primeiro agente a aceitar: move sessão para waiting_user_approval
-          session.status = "waiting_user_approval";
-          session.acceptedAt = ticket.acceptedAt;
-          session.approvalExpiresAt = ticket.approvalExpiresAt;
-          session.primaryTicketId = ticket.id;
-          touch(session);
+    socket.on(
+      EVENTS.INVITE_ACCEPT,
+      withAck(socket, (data) => {
+        const agent = requireRegistered(socket);
+        const invite = getInvite(data.inviteId);
+        if (invite.agentId !== agent.id)
+          throw new SupportError("FORBIDDEN", "Convite atribuído a outro atendente");
+        if (invite.status !== "pending")
+          throw new SupportError("INVALID_STATE", `Convite em estado inválido: ${invite.status}`);
 
-          nsp.to(userRoom(ticket.requesterId)).emit(EVENTS.TICKET_ACCEPTED, payload);
-          nsp.to(userRoom(ticket.requesterId)).emit(EVENTS.SESSION_APPROVAL_REQUESTED, payload);
+        const room = getRoom(invite.roomCode);
+        if (room.status !== "open")
+          throw new SupportError("INVALID_STATE", `Sala em estado inválido: ${room.status}`);
 
-          setTimer(
-            ticket.id,
-            () => {
-              if (ticket.status === "waiting_user_approval")
-                rejectTicket(ticket, session, "expired", "approval_timeout", agent.id);
-            },
-            TTL.APPROVAL_MS,
-          );
-        } else if (session.status === "waiting_user_approval") {
-          // Agente adicional aceita enquanto aguarda aprovação
-          touch(session);
-          nsp.to(userRoom(ticket.requesterId)).emit(EVENTS.TICKET_ACCEPTED, payload);
-        } else if (session.status === "active") {
-          // Sessão já ativa: agente entra diretamente
-          touch(session);
-          const agentSockets = await nsp.in(userRoom(agent.id)).fetchSockets();
-          for (const s of agentSockets) s.join(sessionRoom(session.code));
-          nsp.to(sessionRoom(session.code)).emit(EVENTS.PARTICIPANT_JOINED, session.participants[agent.id]);
-        }
+        clearTimer(invite.id);
+        invite.status = "awaiting_owner_approval";
+        invite.acceptedAt = now();
+        invite.approvalExpiresAt = new Date(Date.now() + TTL.APPROVAL_MS).toISOString();
+        touch(invite);
+
+        setTimer(
+          invite.id,
+          () => {
+            if (invite.status === "awaiting_owner_approval") {
+              clearTimer(invite.id);
+              invite.status = "expired";
+              invite.finishedAt = now();
+              invite.finishReason = "approval_timeout";
+              touch(invite);
+              nsp.to(userRoom(invite.agentId)).emit(EVENTS.INVITE_UPDATED, { invite });
+              nsp.to(userRoom(room.ownerId)).emit(EVENTS.INVITE_UPDATED, { invite });
+            }
+          },
+          TTL.APPROVAL_MS,
+        );
+
+        emitLog(room, {
+          actorId: agent.id,
+          type: "invite_accepted",
+          message: `${agent.name} aceitou o convite`,
+        });
+
+        const payload = { invite, room };
+        nsp.to(userRoom(agent.id)).emit(EVENTS.INVITE_UPDATED, payload);
+        nsp.to(userRoom(room.ownerId)).emit(EVENTS.INVITE_UPDATED, payload);
+        nsp.to(userRoom(room.ownerId)).emit(EVENTS.OWNER_APPROVAL_REQUESTED, payload);
 
         return payload;
       }),
     );
 
     socket.on(
-      EVENTS.SESSION_CONFIRM,
+      EVENTS.INVITE_DECLINE,
+      withAck(socket, (data) => {
+        const agent = requireRegistered(socket);
+        const invite = getInvite(data.inviteId);
+        if (invite.agentId !== agent.id)
+          throw new SupportError("FORBIDDEN", "Convite atribuído a outro atendente");
+        if (!isOpenInvite(invite))
+          throw new SupportError("INVALID_STATE", `Convite em estado inválido: ${invite.status}`);
+
+        clearTimer(invite.id);
+        invite.status = "declined";
+        invite.finishedAt = now();
+        invite.finishReason = "declined_by_agent";
+        touch(invite);
+
+        const room = rooms.get(invite.roomCode);
+        if (room) {
+          emitLog(room, {
+            actorId: agent.id,
+            type: "invite_declined",
+            message: `${agent.name} recusou o convite`,
+          });
+          nsp.to(userRoom(room.ownerId)).emit(EVENTS.INVITE_UPDATED, { invite });
+        }
+
+        return { invite };
+      }),
+    );
+
+    socket.on(
+      EVENTS.INVITE_CANCEL,
+      withAck(socket, (data) => {
+        const requester = requireRegistered(socket);
+        const invite = getInvite(data.inviteId);
+        if (invite.requesterId !== requester.id)
+          throw new SupportError("FORBIDDEN", "Apenas o dono da sala pode cancelar o convite");
+        if (!isOpenInvite(invite))
+          throw new SupportError("INVALID_STATE", `Convite em estado inválido: ${invite.status}`);
+
+        clearTimer(invite.id);
+        invite.status = "cancelled";
+        invite.finishedAt = now();
+        invite.finishReason = "cancelled_by_owner";
+        touch(invite);
+
+        nsp.to(userRoom(invite.agentId)).emit(EVENTS.INVITE_UPDATED, { invite });
+        return { invite };
+      }),
+    );
+
+    socket.on(
+      EVENTS.INVITE_APPROVE,
       withAck(socket, async (data) => {
-        const user = requireRegistered(socket);
-        const session = getSession(data.sessionCode);
-        if (session.requesterId !== user.id)
-          throw new SupportError("FORBIDDEN", "Apenas o solicitante pode confirmar a sessão");
-        if (session.status !== "waiting_user_approval")
-          throw new SupportError("INVALID_STATE", `Sessão em estado inválido: ${session.status}`);
+        const owner = requireRegistered(socket);
+        const invite = getInvite(data.inviteId);
+        if (invite.requesterId !== owner.id)
+          throw new SupportError("FORBIDDEN", "Apenas o dono da sala pode aprovar o convite");
+        if (invite.status !== "awaiting_owner_approval")
+          throw new SupportError("INVALID_STATE", `Convite em estado inválido: ${invite.status}`);
 
-        const primaryTicket = tickets.get(session.primaryTicketId);
-        if (!primaryTicket) throw new SupportError("TICKET_NOT_FOUND", "Chamado não encontrado");
-
-        clearTimer(primaryTicket.id);
+        const room = getRoom(invite.roomCode);
+        clearTimer(invite.id);
 
         if (!data.approved) {
-          // Rejeita todos os tickets abertos desta sessão
-          for (const t of tickets.values()) {
-            if (t.sessionCode === session.code && isOpenTicket(t)) {
-              clearTimer(t.id);
-              t.status = "rejected";
-              t.finishedAt = now();
-              t.finishReason = "rejected_by_user";
-              touch(t);
-            }
-          }
-          session.status = "finished";
-          session.finishedAt = now();
-          session.finishReason = "rejected_by_user";
-          touch(session);
-          const rejPayload = { ticket: primaryTicket, session };
-          nsp.to(userRoom(session.requesterId)).emit(EVENTS.SESSION_FINISHED, rejPayload);
-          for (const [uid, p] of Object.entries(session.participants)) {
-            if (p.role === "agent") nsp.to(userRoom(uid)).emit(EVENTS.SESSION_FINISHED, rejPayload);
-          }
-          return rejPayload;
+          invite.status = "denied";
+          invite.finishedAt = now();
+          invite.finishReason = "denied_by_owner";
+          touch(invite);
+
+          const payload = { invite, room };
+          nsp.to(userRoom(invite.agentId)).emit(EVENTS.INVITE_UPDATED, payload);
+          return payload;
         }
 
-        // Ativa todos os tickets aceitos e marca os demais como expirados
-        for (const t of tickets.values()) {
-          if (t.sessionCode === session.code) {
-            if (t.status === "waiting_user_approval") {
-              clearTimer(t.id);
-              t.status = "active";
-              touch(t);
-            } else if (t.status === "requested") {
-              clearTimer(t.id);
-              t.status = "expired";
-              t.finishedAt = now();
-              t.finishReason = "session_confirmed_without_response";
-              touch(t);
-            }
-          }
-        }
+        invite.status = "joined";
+        touch(invite);
 
-        session.status = "active";
-        session.activeAt = now();
-        session.participants[session.requesterId] = {
-          ...createParticipant(session.requesterId, "requester"),
-          ...session.participants[session.requesterId],
-          connected: true,
-        };
-        // Garante que todos os agentes que aceitaram estão nos participants
-        for (const [uid, p] of Object.entries(session.participants)) {
-          if (p.role === "agent") {
-            session.participants[uid] = { ...createParticipant(uid, "agent"), ...p };
-          }
-        }
-        touch(session);
+        joinParticipant(room, invite.agentId, "agent");
+        const agentSockets = await nsp.in(userRoom(invite.agentId)).fetchSockets();
+        for (const s of agentSockets) s.join(roomRoom(room.code));
 
-        // Junta todos os participantes à sala da sessão
-        for (const userId of Object.keys(session.participants)) {
-          const memberSockets = await nsp.in(userRoom(userId)).fetchSockets();
-          for (const memberSocket of memberSockets) memberSocket.join(sessionRoom(session.code));
-        }
-
-        const payload = { ticket: primaryTicket, session };
-        nsp.to(sessionRoom(session.code)).emit(EVENTS.SESSION_ACTIVE, payload);
-        for (const participant of Object.values(session.participants)) {
-          nsp.to(sessionRoom(session.code)).emit(EVENTS.PARTICIPANT_JOINED, participant);
-        }
-
-        emitLog(session, {
-          actorId: user.id,
-          type: "session_started",
-          message: "Atendimento iniciado",
+        emitLog(room, {
+          actorId: owner.id,
+          type: "participant_joined",
+          message: `${invite.agentId} entrou na sala`,
         });
+
+        const payload = { invite, room };
+        nsp.to(userRoom(invite.agentId)).emit(EVENTS.INVITE_UPDATED, payload);
+        nsp.to(roomRoom(room.code)).emit(EVENTS.PARTICIPANT_JOINED, room.participants[invite.agentId]);
 
         return payload;
       }),
     );
 
     socket.on(
-      EVENTS.SESSION_FINISH,
-      withAck(socket, (data) => {
-        const user = requireRegistered(socket);
-        const session = getSession(data.sessionCode);
-        if (!session.participants[user.id])
-          throw new SupportError("FORBIDDEN", "Usuário não participa desta sessão");
-        finishSession(session, data.reason ?? "finished", user.id);
+      EVENTS.ROOM_LEAVE,
+      withAck(socket, async (data) => {
+        const { user, room } = requireOpenRoomParticipant(socket, data.roomCode);
+
+        if (room.ownerId === user.id) {
+          closeRoom(room, "closed", user.id);
+          return undefined;
+        }
+
+        leaveParticipant(room, user.id);
+
+        // Marca o convite correspondente (já "joined") como encerrado.
+        for (const invite of invites.values()) {
+          if (invite.roomCode === room.code && invite.agentId === user.id && invite.status === "joined") {
+            invite.status = "left";
+            invite.finishedAt = now();
+            invite.finishReason = "left_by_agent";
+            touch(invite);
+          }
+        }
+
+        emitLog(room, {
+          actorId: user.id,
+          type: "participant_left",
+          message: `${user.name} saiu da sala`,
+        });
+
+        nsp.to(roomRoom(room.code)).emit(EVENTS.PARTICIPANT_LEFT, { userId: user.id });
+        nsp.to(roomRoom(room.code)).emit(EVENTS.DRIVER_CHANGED, { roomCode: room.code, driverId: room.driverId });
+
+        const memberSockets = await nsp.in(userRoom(user.id)).fetchSockets();
+        for (const memberSocket of memberSockets) memberSocket.leave(roomRoom(room.code));
+
         return undefined;
       }),
     );
 
     socket.on(
-      EVENTS.PERMISSION_REQUEST,
-      withAck(socket, (data) => {
-        const { user, session, participant } = requireActiveParticipant(socket, data.sessionCode);
-        if (participant.role !== "agent")
-          throw new SupportError("FORBIDDEN", "Apenas atendentes podem solicitar permissões");
-
-        const requested = parseSessionPermissions(data.permissions);
-        session.pendingPermissions = normalizeSessionPermissions([
-          ...(session.pendingPermissions ?? []),
-          ...requested.filter((permission) => !(session.permissions ?? []).includes(permission)),
-        ]);
-        touch(session);
-
-        const payload = { sessionCode: session.code, permissions: requested };
-        nsp.to(userRoom(session.requesterId)).emit(EVENTS.PERMISSION_REQUESTED, payload);
-        emitPermissionState(session);
-        emitLog(session, {
-          actorId: user.id,
-          type: "permission_requested",
-          message: "Permissão solicitada",
-          data: { permissions: requested },
-        });
-        return permissionState(session);
-      }),
-    );
-
-    socket.on(
-      EVENTS.PERMISSION_CANCEL,
-      withAck(socket, (data) => {
-        const { session, participant } = requireActiveParticipant(socket, data.sessionCode);
-        if (participant.role !== "agent")
-          throw new SupportError("FORBIDDEN", "Apenas atendentes podem cancelar solicitações");
-
-        const cancelled = parseSessionPermissions(data.permissions);
-        session.pendingPermissions = (session.pendingPermissions ?? []).filter(
-          (permission) => !cancelled.includes(permission),
-        );
-        touch(session);
-        emitPermissionState(session);
-        return permissionState(session);
-      }),
-    );
-
-    socket.on(
-      EVENTS.PERMISSION_GRANT,
-      withAck(socket, (data) => {
-        const { user, session, participant } = requireActiveParticipant(socket, data.sessionCode);
-        if (participant.role !== "requester")
-          throw new SupportError("FORBIDDEN", "Apenas o solicitante pode conceder permissões");
-
-        const granted = applyGrant([], parseSessionPermissions(data.permissions));
-        session.permissions = applyGrant(session.permissions, granted);
-        session.pendingPermissions = (session.pendingPermissions ?? []).filter(
-          (permission) => !granted.includes(permission),
-        );
-        touch(session);
-
-        const payload = { sessionCode: session.code, permissions: granted };
-        nsp.to(sessionRoom(session.code)).emit(EVENTS.PERMISSION_GRANTED, payload);
-        emitPermissionState(session);
-        emitLog(session, {
-          actorId: user.id,
-          type: "permission_granted",
-          message: "Permissão concedida",
-          data: { permissions: granted },
-        });
-        return permissionState(session);
-      }),
-    );
-
-    socket.on(
-      EVENTS.PERMISSION_REVOKE,
-      withAck(socket, (data) => {
-        const { user, session, participant } = requireActiveParticipant(socket, data.sessionCode);
-        if (participant.role !== "requester")
-          throw new SupportError("FORBIDDEN", "Apenas o solicitante pode revogar permissões");
-
-        const revoked = parseSessionPermissions(data.permissions);
-        session.permissions = applyRevoke(session.permissions, revoked);
-        session.pendingPermissions = applyRevoke(session.pendingPermissions, revoked);
-        touch(session);
-
-        const payload = { sessionCode: session.code, permissions: revoked };
-        nsp.to(sessionRoom(session.code)).emit(EVENTS.PERMISSION_REVOKED, payload);
-        emitPermissionState(session);
-        emitLog(session, {
-          actorId: user.id,
-          type: "permission_revoked",
-          message: "Permissão revogada",
-          data: { permissions: revoked },
-        });
-        return permissionState(session);
-      }),
-    );
-
-    socket.on(
-      EVENTS.SESSION_HEARTBEAT,
+      EVENTS.ROOM_CLOSE,
       withAck(socket, (data) => {
         const user = requireRegistered(socket);
-        const session = getSession(data.sessionCode);
-        const participant = session.participants[user.id];
+        const room = getRoom(data.roomCode);
+        if (room.ownerId !== user.id)
+          throw new SupportError("FORBIDDEN", "Apenas o dono da sala pode encerrá-la");
+        closeRoom(room, "closed", user.id);
+        return undefined;
+      }),
+    );
+
+    socket.on(
+      EVENTS.ROOM_HEARTBEAT,
+      withAck(socket, (data) => {
+        const user = requireRegistered(socket);
+        const room = rooms.get(data.roomCode);
+        const participant = room?.participants[user.id];
         if (participant) {
           participant.connected = true;
           participant.lastHeartbeatAt = now();
@@ -567,35 +543,166 @@ export function registerHandlers(nsp) {
       }),
     );
 
+    socket.on(
+      EVENTS.DRIVER_CLAIM,
+      withAck(socket, (data) => {
+        const { user, room, participant } = requireOpenRoomParticipant(socket, data.roomCode);
+        if (participant.role !== "agent")
+          throw new SupportError("FORBIDDEN", "Apenas atendentes podem assumir o controle");
+        if (!(room.permissions ?? []).includes("ControlCoBrowsing"))
+          throw new SupportError("FORBIDDEN", "Permissão de controle não concedida");
+        if (room.driverId && room.driverId !== user.id)
+          throw new SupportError("DRIVER_BUSY", "Outro atendente já está no controle");
+
+        setDriver(room, user.id);
+        nsp.to(roomRoom(room.code)).emit(EVENTS.DRIVER_CHANGED, { roomCode: room.code, driverId: room.driverId });
+        return { roomCode: room.code, driverId: room.driverId };
+      }),
+    );
+
+    socket.on(
+      EVENTS.DRIVER_RELEASE,
+      withAck(socket, (data) => {
+        const { user, room } = requireOpenRoomParticipant(socket, data.roomCode);
+        clearDriver(room, user.id);
+        nsp.to(roomRoom(room.code)).emit(EVENTS.DRIVER_CHANGED, { roomCode: room.code, driverId: room.driverId });
+        return { roomCode: room.code, driverId: room.driverId };
+      }),
+    );
+
+    socket.on(
+      EVENTS.PERMISSION_REQUEST,
+      withAck(socket, (data) => {
+        const { user, room, participant } = requireOpenRoomParticipant(socket, data.roomCode);
+        if (participant.role !== "agent")
+          throw new SupportError("FORBIDDEN", "Apenas atendentes podem solicitar permissões");
+
+        const requested = parseSessionPermissions(data.permissions);
+        room.pendingPermissions = normalizeSessionPermissions([
+          ...(room.pendingPermissions ?? []),
+          ...requested.filter((permission) => !(room.permissions ?? []).includes(permission)),
+        ]);
+        touch(room);
+
+        const payload = { roomCode: room.code, permissions: requested };
+        nsp.to(userRoom(room.ownerId)).emit(EVENTS.PERMISSION_REQUESTED, payload);
+        emitPermissionState(room);
+        emitLog(room, {
+          actorId: user.id,
+          type: "permission_requested",
+          message: "Permissão solicitada",
+          data: { permissions: requested },
+        });
+        return permissionState(room);
+      }),
+    );
+
+    socket.on(
+      EVENTS.PERMISSION_CANCEL,
+      withAck(socket, (data) => {
+        const { room, participant } = requireOpenRoomParticipant(socket, data.roomCode);
+        if (participant.role !== "agent")
+          throw new SupportError("FORBIDDEN", "Apenas atendentes podem cancelar solicitações");
+
+        const cancelled = parseSessionPermissions(data.permissions);
+        room.pendingPermissions = (room.pendingPermissions ?? []).filter(
+          (permission) => !cancelled.includes(permission),
+        );
+        touch(room);
+        emitPermissionState(room);
+        return permissionState(room);
+      }),
+    );
+
+    socket.on(
+      EVENTS.PERMISSION_GRANT,
+      withAck(socket, (data) => {
+        const { user, room, participant } = requireOpenRoomParticipant(socket, data.roomCode);
+        if (participant.role !== "requester")
+          throw new SupportError("FORBIDDEN", "Apenas o dono da sala pode conceder permissões");
+
+        const granted = applyGrant([], parseSessionPermissions(data.permissions));
+        room.permissions = applyGrant(room.permissions, granted);
+        room.pendingPermissions = (room.pendingPermissions ?? []).filter(
+          (permission) => !granted.includes(permission),
+        );
+        touch(room);
+
+        const payload = { roomCode: room.code, permissions: granted };
+        nsp.to(roomRoom(room.code)).emit(EVENTS.PERMISSION_GRANTED, payload);
+        emitPermissionState(room);
+        emitLog(room, {
+          actorId: user.id,
+          type: "permission_granted",
+          message: "Permissão concedida",
+          data: { permissions: granted },
+        });
+        return permissionState(room);
+      }),
+    );
+
+    socket.on(
+      EVENTS.PERMISSION_REVOKE,
+      withAck(socket, (data) => {
+        const { user, room, participant } = requireOpenRoomParticipant(socket, data.roomCode);
+        if (participant.role !== "requester")
+          throw new SupportError("FORBIDDEN", "Apenas o dono da sala pode revogar permissões");
+
+        const revoked = parseSessionPermissions(data.permissions);
+        room.permissions = applyRevoke(room.permissions, revoked);
+        room.pendingPermissions = applyRevoke(room.pendingPermissions, revoked);
+        touch(room);
+
+        // Sem ControlCoBrowsing, o piloto perde o token.
+        if (!room.permissions.includes("ControlCoBrowsing") && room.driverId) {
+          room.driverId = null;
+          nsp.to(roomRoom(room.code)).emit(EVENTS.DRIVER_CHANGED, { roomCode: room.code, driverId: null });
+        }
+
+        const payload = { roomCode: room.code, permissions: revoked };
+        nsp.to(roomRoom(room.code)).emit(EVENTS.PERMISSION_REVOKED, payload);
+        emitPermissionState(room);
+        emitLog(room, {
+          actorId: user.id,
+          type: "permission_revoked",
+          message: "Permissão revogada",
+          data: { permissions: revoked },
+        });
+        return permissionState(room);
+      }),
+    );
+
     // Sem ack no frontend: erros apenas logados.
     socket.on(EVENTS.PRESENCE_UPDATE, (envelope) => {
       const userId = socket.data.userId;
       const data = envelope?.data;
-      if (!userId || !data?.sessionCode) return;
-      const session = sessions.get(data.sessionCode);
-      if (!session || session.status !== "active" || !session.participants[userId]) return;
+      if (!userId || !data?.roomCode) return;
+      const room = rooms.get(data.roomCode);
+      if (!room || room.status !== "open" || !room.participants[userId]) return;
 
       const presence = { ...data, userId, updatedAt: now() };
-      socket.to(sessionRoom(session.code)).emit(EVENTS.PRESENCE_UPDATED, presence);
+      socket.to(roomRoom(room.code)).emit(EVENTS.PRESENCE_UPDATED, presence);
     });
 
     socket.on(EVENTS.REMOTE_COMMAND, (envelope) => {
       const userId = socket.data.userId;
       const data = envelope?.data;
-      if (!userId || !data?.sessionCode || !data?.type) return;
-      const session = sessions.get(data.sessionCode);
-      if (!session || session.status !== "active") return;
-      const participant = session.participants[userId];
+      if (!userId || !data?.roomCode || !data?.type) return;
+      const room = rooms.get(data.roomCode);
+      if (!room || room.status !== "open") return;
+      const participant = room.participants[userId];
       if (!participant || participant.role !== "agent") return;
-      if (!(session.permissions ?? []).includes("ControlCoBrowsing")) return;
+      if (!(room.permissions ?? []).includes("ControlCoBrowsing")) return;
+      // Exclusão mútua: só o piloto atual pode emitir comandos. Sem claim explícito, nada acontece.
+      if (room.driverId !== userId) return;
 
       const command = {
         ...data,
         issuedByParticipantId: userId,
         at: data.at ?? Date.now(),
       };
-      nsp.to(userRoom(session.requesterId)).emit(EVENTS.REMOTE_COMMAND_RECEIVED, command);
-      emitLog(session, {
+      nsp.to(userRoom(room.ownerId)).emit(EVENTS.REMOTE_COMMAND_RECEIVED, command);
+      emitLog(room, {
         actorId: userId,
         type: "remote_command",
         message: `Comando remoto enviado (${command.type})`,
@@ -610,21 +717,21 @@ export function registerHandlers(nsp) {
     socket.on(EVENTS.COBROWSING_EVENT, (envelope) => {
       const userId = socket.data.userId;
       const data = envelope?.data;
-      if (!userId || !data?.sessionCode || !data?.type) return;
-      const session = sessions.get(data.sessionCode);
-      if (!session || session.status !== "active" || !session.participants[userId]) return;
+      if (!userId || !data?.roomCode || !data?.type) return;
+      const room = rooms.get(data.roomCode);
+      if (!room || room.status !== "open" || !room.participants[userId]) return;
 
-      const event = appendCobrowsingEvent(session, {
+      const event = appendCobrowsingEvent(room, {
         userId,
         type: data.type,
         payload: data.payload,
         operationTrace: envelope.operationTrace,
       });
-      socket.to(sessionRoom(session.code)).emit(EVENTS.COBROWSING_EVENT_RECEIVED, event);
+      socket.to(roomRoom(room.code)).emit(EVENTS.COBROWSING_EVENT_RECEIVED, event);
 
       // Eventos de alta frequência não viram log.
       if (data.type !== "scroll_changed" && data.type !== "pointer_moved") {
-        emitLog(session, {
+        emitLog(room, {
           actorId: userId,
           type: `cobrowsing_${data.type}`,
           // Mensagem amigável é montada no frontend (tem contexto do DOM); fallback genérico.
@@ -643,14 +750,20 @@ export function registerHandlers(nsp) {
       user.sockets.delete(socket.id);
       if (user.sockets.size > 0) return;
 
-      // Última conexão do usuário caiu: marca offline e avisa salas ativas.
+      // Última conexão do usuário caiu: marca offline nas salas abertas.
+      // O dono desconectado leva à sala fechada pelo sweeper (TTL); atendente
+      // desconectado só fica marcado offline — a sala continua.
       broadcastAgents(user.contextCode);
-      for (const session of sessions.values()) {
-        const participant = session.participants[userId];
-        if (session.status !== "active" || !participant) continue;
+      for (const room of rooms.values()) {
+        const participant = room.participants[userId];
+        if (room.status !== "open" || !participant) continue;
         participant.connected = false;
         participant.leftAt = now();
-        nsp.to(sessionRoom(session.code)).emit(EVENTS.PARTICIPANT_LEFT, { userId });
+        if (room.driverId === userId) {
+          room.driverId = null;
+          nsp.to(roomRoom(room.code)).emit(EVENTS.DRIVER_CHANGED, { roomCode: room.code, driverId: null });
+        }
+        nsp.to(roomRoom(room.code)).emit(EVENTS.PARTICIPANT_LEFT, { userId });
       }
     });
   });

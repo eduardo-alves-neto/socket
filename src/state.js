@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { PERMISSIONS } from "./events.js";
 
-const MAX_SESSION_EVENTS = 200;
-const MAX_SESSION_LOGS = 200;
+const MAX_ROOM_EVENTS = 200;
+const MAX_ROOM_LOGS = 200;
 
 export const SESSION_PERMISSIONS = [
   "ViewCoBrowsing",
@@ -58,11 +58,11 @@ export function applyRevoke(current = [], revoked = []) {
 
 // userId -> { id, contextCode, name, email, avatar, permissions: Set, sockets: Set<socketId> }
 export const users = new Map();
-// ticketId -> SupportTicket
-export const tickets = new Map();
-// sessionCode -> SupportSession
-export const sessions = new Map();
-// ticketId -> Timeout (expiração de ticket/aprovação)
+// inviteId -> SupportInvite
+export const invites = new Map();
+// roomCode -> SupportRoom
+export const rooms = new Map();
+// inviteId -> Timeout (expiração de convite/aprovação)
 export const timers = new Map();
 
 export class SupportError extends Error {
@@ -123,16 +123,17 @@ export function createParticipant(userId, role) {
   };
 }
 
-export function createSessionWithTickets({ requesterId, agentIds, mode, ttlMs, permissions = [] }) {
+// Cria a sala imediatamente, já com o dono (requester) como participante.
+// A sala não depende de nenhum convite específico — convites são criados à parte.
+export function createRoom({ ownerId, mode, permissions = [] }) {
   const ts = now();
-  const sessionCode = randomUUID();
-  const session = {
-    code: sessionCode,
-    requesterId,
-    agentIds,
+  const room = {
+    code: randomUUID(),
+    ownerId,
     mode,
-    status: "requested",
-    participants: { [requesterId]: createParticipant(requesterId, "requester") },
+    status: "open",
+    driverId: null,
+    participants: { [ownerId]: createParticipant(ownerId, "requester") },
     cobrowsingEvents: [],
     logs: [],
     permissions: applyGrant([], permissions),
@@ -140,126 +141,131 @@ export function createSessionWithTickets({ requesterId, agentIds, mode, ttlMs, p
     createdAt: ts,
     updatedAt: ts,
   };
-  sessions.set(session.code, session);
-
-  const createdTickets = agentIds.map((agentId) => {
-    const ticket = {
-      id: randomUUID(),
-      sessionCode,
-      requesterId,
-      agentId,
-      mode,
-      status: "requested",
-      createdAt: ts,
-      updatedAt: ts,
-      expiresAt: new Date(Date.now() + ttlMs).toISOString(),
-    };
-    tickets.set(ticket.id, ticket);
-    return ticket;
-  });
-
-  return { session, tickets: createdTickets };
+  rooms.set(room.code, room);
+  return room;
 }
 
-export function createTicketWithSession({ requesterId, agentId, mode, ttlMs, permissions = [] }) {
+// Cria um convite individual e independente para um atendente. Não há convite "primário":
+// cada um tem sua própria máquina de estados (pending -> awaiting_owner_approval -> joined).
+export function createInvite({ roomCode, requesterId, agentId, mode, ttlMs }) {
   const ts = now();
-  const ticket = {
+  const invite = {
     id: randomUUID(),
-    sessionCode: randomUUID(),
+    roomCode,
     requesterId,
     agentId,
     mode,
-    status: "requested",
+    status: "pending",
     createdAt: ts,
     updatedAt: ts,
     expiresAt: new Date(Date.now() + ttlMs).toISOString(),
   };
-  const session = {
-    code: ticket.sessionCode,
-    ticketId: ticket.id,
-    requesterId,
-    agentId,
-    mode,
-    status: "requested",
-    participants: { [requesterId]: createParticipant(requesterId, "requester") },
-    cobrowsingEvents: [],
-    logs: [],
-    permissions: applyGrant([], permissions),
-    pendingPermissions: [],
-    createdAt: ts,
-    updatedAt: ts,
-  };
-  tickets.set(ticket.id, ticket);
-  sessions.set(session.code, session);
-  return { ticket, session };
+  invites.set(invite.id, invite);
+  return invite;
 }
 
-export function appendLog(session, { actorId, type, message, data }) {
+export function touch(...records) {
+  const ts = now();
+  for (const record of records) record.updatedAt = ts;
+}
+
+export function joinParticipant(room, userId, role) {
+  room.participants[userId] = {
+    ...createParticipant(userId, role),
+    ...room.participants[userId],
+    connected: true,
+  };
+  touch(room);
+  return room.participants[userId];
+}
+
+export function leaveParticipant(room, userId) {
+  const participant = room.participants[userId];
+  if (!participant) return null;
+  delete room.participants[userId];
+  if (room.driverId === userId) room.driverId = null;
+  touch(room);
+  return participant;
+}
+
+export function setDriver(room, agentId) {
+  room.driverId = agentId;
+  touch(room);
+}
+
+export function clearDriver(room, agentId) {
+  if (room.driverId !== agentId) return false;
+  room.driverId = null;
+  touch(room);
+  return true;
+}
+
+export function appendLog(room, { actorId, type, message, data }) {
   const log = {
     id: randomUUID(),
-    sessionCode: session.code,
+    roomCode: room.code,
     actorId,
     type,
     message,
     data,
     createdAt: now(),
   };
-  session.logs.unshift(log);
-  if (session.logs.length > MAX_SESSION_LOGS) session.logs.length = MAX_SESSION_LOGS;
+  room.logs.unshift(log);
+  if (room.logs.length > MAX_ROOM_LOGS) room.logs.length = MAX_ROOM_LOGS;
   return log;
 }
 
-export function appendCobrowsingEvent(session, { userId, type, payload, operationTrace }) {
+export function appendCobrowsingEvent(room, { userId, type, payload, operationTrace }) {
   const event = {
     id: randomUUID(),
-    sessionCode: session.code,
+    roomCode: room.code,
     userId,
     type,
     payload: payload ?? {},
     operationTrace,
     createdAt: now(),
   };
-  session.cobrowsingEvents.unshift(event);
-  if (session.cobrowsingEvents.length > MAX_SESSION_EVENTS)
-    session.cobrowsingEvents.length = MAX_SESSION_EVENTS;
+  room.cobrowsingEvents.unshift(event);
+  if (room.cobrowsingEvents.length > MAX_ROOM_EVENTS)
+    room.cobrowsingEvents.length = MAX_ROOM_EVENTS;
   return event;
 }
 
-const OPEN_TICKET_STATUSES = new Set(["requested", "waiting_user_approval", "active"]);
+const OPEN_INVITE_STATUSES = new Set(["pending", "awaiting_owner_approval"]);
 
-export function isOpenTicket(ticket) {
-  return OPEN_TICKET_STATUSES.has(ticket.status);
+export function isOpenInvite(invite) {
+  return OPEN_INVITE_STATUSES.has(invite.status);
 }
 
 export function buildBootstrap(user) {
-  const userTickets = [...tickets.values()].filter(
-    (t) => isOpenTicket(t) && (t.requesterId === user.id || t.agentId === user.id),
+  const userRooms = [...rooms.values()].filter(
+    (r) => r.status === "open" && r.participants[user.id],
   );
-  const userSessions = [...sessions.values()].filter(
-    (s) => s.status === "active" && s.participants[user.id],
+  const userInvites = [...invites.values()].filter(
+    (i) => isOpenInvite(i) && (i.requesterId === user.id || i.agentId === user.id),
   );
   return {
     user: toAgent(user),
     agents: listAgents(user.contextCode),
-    tickets: userTickets,
-    sessions: userSessions,
+    rooms: userRooms,
+    invites: userInvites,
   };
 }
 
-export function clearTimer(ticketId) {
-  const timer = timers.get(ticketId);
+export function clearTimer(inviteId) {
+  const timer = timers.get(inviteId);
   if (timer) {
     clearTimeout(timer);
-    timers.delete(ticketId);
+    timers.delete(inviteId);
   }
 }
 
-export function setTimer(ticketId, fn, ms) {
-  clearTimer(ticketId);
+export function setTimer(inviteId, fn, ms) {
+  clearTimer(inviteId);
   const timer = setTimeout(() => {
-    timers.delete(ticketId);
+    timers.delete(inviteId);
     fn();
   }, ms);
   timer.unref?.();
-  timers.set(ticketId, timer);
+  timers.set(inviteId, timer);
 }

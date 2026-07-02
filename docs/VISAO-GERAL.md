@@ -3,9 +3,10 @@
 ## Objetivo
 
 Este serviço é o backend de tempo real que sustenta o **suporte remoto por
-co-browsing** do produto One. Ele permite que um **atendente** acompanhe — e,
-quando autorizado, controle — a tela de um **usuário** diretamente dentro da
-aplicação web, sem compartilhamento de vídeo e sem WebRTC.
+co-browsing** do produto One. Ele permite que **um ou mais atendentes**
+acompanhem — e, quando autorizado, controlem — a tela de um **usuário**
+diretamente dentro da aplicação web, sem compartilhamento de vídeo e sem
+WebRTC.
 
 Em vez de transmitir pixels, a sessão trafega **eventos semânticos**: mudanças
 de rota, posição de scroll, movimento de ponteiro, cliques e comandos de
@@ -15,27 +16,46 @@ controle de estado e de permissões**.
 
 O papel do servidor se resume a três responsabilidades:
 
-1. **Orquestrar o ciclo de vida** de chamados (tickets) e sessões — quem pediu,
-   quem aceitou, quem confirmou, quando expira.
+1. **Orquestrar o ciclo de vida** de salas (lobbies) e convites — quem criou a
+   sala, quem foi convidado, quem aceitou, quem confirmou, quando expira.
 2. **Isolar e retransmitir** os eventos de co-browsing apenas entre os
-   participantes legítimos de cada sessão.
-3. **Ser a fonte da verdade das permissões**: nada de controle remoto acontece
-   sem que o usuário tenha concedido a permissão correspondente.
+   participantes legítimos de cada sala.
+3. **Ser a fonte da verdade das permissões e do controle**: nada de controle
+   remoto acontece sem a permissão da sala **e** sem que o atendente seja o
+   piloto (`driverId`) atual.
 
 Atualmente todo o estado vive **em memória**. não adicionamos BD
+
+---
+
+## Modelo mental: lobby de jogo
+
+O usuário é sempre o **dono da sala** (`owner`). Ele cria a sala e envia
+**convites individuais** — um por atendente escolhido. Cada atendente
+aceita ou recusa **o seu próprio convite**, de forma independente dos demais.
+A sala não depende de nenhum convite específico: ela existe assim que o dono a
+cria, e permanece aberta enquanto o dono estiver presente, **mesmo que nenhum
+atendente tenha entrado ainda** ou que atendentes entrem e saiam ao longo do
+tempo.
+
+Isso resolve a principal fonte de bugs do modelo anterior (1 sessão atrelada a
+"o primeiro atendente que aceitou"): cada atendente tem seu próprio ciclo de
+vida de convite, e a sala tem o seu, desacoplado.
+
 ---
 
 ## Conceitos
 
 | Conceito | O que é |
 |---|---|
-| **Usuário (requester)** | Quem pede ajuda. Precisa da permissão global `remote-support.request`. |
-| **Atendente (agent)** | Quem presta suporte. Precisa da permissão global `remote-support.agent`. |
+| **Usuário / dono (`owner`)** | Quem cria a sala e convida atendentes. Precisa da permissão global `remote-support.request`. É sempre o `requester` da sala. |
+| **Atendente (`agent`)** | Quem é convidado e presta suporte. Precisa da permissão global `remote-support.agent`. Uma sala pode ter **vários** atendentes simultâneos. |
 | **Contexto (`ContextCode`)** | Fronteira multi-tenant. Informado no handshake; a lista de atendentes disponíveis é sempre filtrada por contexto. |
-| **Ticket** | Um convite de suporte direcionado a **um** atendente. Um pedido pode gerar vários tickets (um por atendente escolhido). |
-| **Sessão** | O atendimento em si. Agrupa o usuário e os atendentes que efetivamente entraram. É onde vivem os eventos, os logs e as permissões. |
-| **Participante** | Uma pessoa dentro de uma sessão, com papel `requester` ou `agent`, estado de conexão e último heartbeat. |
-| **Permissão de sessão** | Autorização concedida pelo usuário *dentro* de uma sessão: `ViewCoBrowsing`, `ControlCoBrowsing`, `ShowRemotePointer`. |
+| **Sala (`SupportRoom`)** | O lobby em si — criado pelo dono, existe independentemente de qualquer convite. É onde vivem os participantes, eventos, logs, permissões e o piloto atual. |
+| **Convite (`SupportInvite`)** | Um convite individual, direcionado a **um** atendente. Tem sua própria máquina de estados, isolada dos demais convites da mesma sala. |
+| **Participante** | Uma pessoa dentro de uma sala, com papel `requester` (o dono) ou `agent`, estado de conexão e último heartbeat. |
+| **Piloto (`driverId`)** | O **único** atendente autorizado a emitir comandos de controle remoto na sala em um dado momento. Token exclusivo, reivindicado explicitamente (`driver:claim`) e liberado (`driver:release`). |
+| **Permissão de sessão** | Autorização concedida pelo dono *dentro* da sala: `ViewCoBrowsing`, `ControlCoBrowsing`, `ShowRemotePointer`. Vale para a sala inteira — o piloto arbitra *quem* usa o controle no momento. |
 
 Um usuário pode ter **várias conexões** (abas) simultâneas: cada aba é um
 socket, mas todas compartilham a mesma identidade e presença. Só quando a
@@ -45,13 +65,15 @@ socket, mas todas compartilham a mesma identidade e presença. Só quando a
 
 ## Modos de atendimento
 
-O ticket carrega um `mode` que descreve a intenção do atendimento:
+O convite carrega um `mode` (herdado da sala) que descreve a intenção do
+atendimento:
 
 - `assisted` — o atendente observa e orienta.
 - `shared` — atendimento compartilhado, potencialmente com controle.
 
-O modo é metadado transportado ponta a ponta; o que efetivamente libera controle
-é a **permissão de sessão**, não o modo.
+O modo é metadado transportado ponta a ponta; o que efetivamente libera
+controle é a **permissão de sessão** somada ao **token de piloto**, não o
+modo.
 
 ---
 
@@ -60,148 +82,125 @@ O modo é metadado transportado ponta a ponta; o que efetivamente libera control
 Há dois níveis distintos e independentes:
 
 **Permissões globais** (quem é quem), vindas do payload de registro:
-- `remote-support.request` — pode abrir chamados.
-- `remote-support.agent` — pode ser listado e aceitar chamados.
+- `remote-support.request` — pode criar salas.
+- `remote-support.agent` — pode ser listado e convidado.
 
-**Permissões de sessão** (o que o atendente pode fazer *nesta* sessão),
-concedidas pelo usuário durante o atendimento. Elas têm **dependências**:
+**Permissões de sessão** (o que os atendentes podem fazer *nesta* sala),
+concedidas pelo dono. Elas têm **dependências**:
 
 ```
 ControlCoBrowsing  ──implica──▶  ViewCoBrowsing
 ShowRemotePointer  ──implica──▶  ViewCoBrowsing
 ```
 
-Isso significa que:
-
 - **Conceder** `ControlCoBrowsing` ou `ShowRemotePointer` concede
   automaticamente `ViewCoBrowsing` junto.
 - **Revogar** `ViewCoBrowsing` derruba em cascata `ControlCoBrowsing` e
-  `ShowRemotePointer`.
+  `ShowRemotePointer`. Se o piloto atual perde `ControlCoBrowsing` por essa
+  cascata, o token é liberado (`driver:changed` com `driverId: null`).
 
-O servidor mantém, por sessão, o conjunto de permissões **concedidas** e a fila
-de **pendentes** (solicitadas pelo atendente, ainda não respondidas). O evento
-`permission:state` é sempre emitido como a **fonte da verdade** — o frontend não
-deve inferir o estado, apenas refletir esse evento.
+O servidor mantém, por sala, o conjunto de permissões **concedidas** e a fila
+de **pendentes** (solicitadas por qualquer atendente, ainda não respondidas).
+O evento `permission:state` é sempre emitido como a **fonte da verdade** — o
+frontend não deve inferir o estado, apenas refletir esse evento.
+
+### Piloto único (`driverId`)
+
+Mesmo com `ControlCoBrowsing` concedida à sala, **só um atendente por vez**
+pode efetivamente emitir comandos (`remote:command`). O controle é um token
+exclusivo:
+
+- `driver:claim` — um atendente com `ControlCoBrowsing` reivindica o token.
+  Falha com `DRIVER_BUSY` se outro atendente já é o piloto.
+- `driver:release` — o piloto libera o token voluntariamente.
+- Sem piloto definido, `remote:command` é **descartado silenciosamente**
+  (fire-and-forget, sem ack) — não há reivindicação implícita por primeiro
+  comando.
+- O piloto é liberado automaticamente quando: ele sai da sala
+  (`room:leave`), desconecta, ou a permissão `ControlCoBrowsing` é revogada.
+- `driver:changed` é retransmitido para toda a sala a cada mudança.
 
 ---
 
 ## Ciclo de vida
 
-### Máquina de estados do ticket
+### Máquina de estados da sala
 
 ```
-requested
-   │  atendente aceita
-   ▼
-waiting_user_approval
-   │  usuário confirma (approved: true)
-   ▼
-active
-   │  encerramento / expiração / rejeição
-   ▼
-finished | expired | rejected
-```
-
-Motivos de saída registrados em `finishReason`: `expired` (ninguém aceitou a
-tempo), `approval_timeout` (aceito, mas o usuário não confirmou),
-`rejected_by_user`, `session_confirmed_without_response` (outro atendente foi
-confirmado antes), ou `finished`.
-
-### Máquina de estados da sessão
-
-Um pedido cria **uma sessão** e **N tickets** (um por atendente). A sessão
-avança conforme os tickets:
-
-```
-requested            ← criada junto com os tickets
-   │  o PRIMEIRO atendente aceita
-   ▼
-waiting_user_approval
-   │  usuário confirma
-   ▼
-active               ← participantes entram na sala, eventos fluem
+open      ← criada pelo dono no room:create, já com ele como participante
+   │
+   │  dono convida mais atendentes a qualquer momento (room:invite)
+   │  atendentes entram e saem livremente (invite:approve / room:leave)
    │
    ▼
-finished | expired
+closed | expired   ← dono encerra (room:close) ou fica sem heartbeat (sweeper)
 ```
 
-Regras que valem a pena fixar:
+A sala **não** tem estado intermediário de "aguardando aprovação" — isso vive
+inteiramente no convite. A sala está `open` desde a criação; co-browsing e
+presence já fluem entre o dono e qualquer atendente que já tenha entrado,
+mesmo com outros convites ainda pendentes.
 
-- **O primeiro atendente a aceitar** move a sessão para
-  `waiting_user_approval` e vira o `primaryTicket`. Atendentes que aceitam
-  depois entram na mesma sessão sem reabrir a confirmação.
-- Ao **confirmar**, todos os tickets ainda em `requested` são marcados como
-  `expired` (`session_confirmed_without_response`) — o usuário já escolheu.
-- Um atendente que aceita **quando a sessão já está `active`** entra
-  diretamente, sem nova aprovação.
-- A sessão só termina de fato quando **não há mais tickets abertos**.
+### Máquina de estados do convite (por atendente, independente)
+
+```
+pending
+   │  atendente aceita         │ atendente recusa → declined
+   ▼                            │ TTL 60s sem resposta → expired
+awaiting_owner_approval         │ dono cancela → cancelled
+   │  dono aprova (approved)    │ dono nega (approved:false) → denied
+   ▼                            │ TTL 90s sem resposta → expired (approval_timeout)
+joined  ── atendente sai / desconecta em definitivo ──► left
+```
+
+Cada convite tem seu próprio temporizador e sua própria notificação. A recusa
+ou expiração de um convite **não afeta** os demais convites da mesma sala nem
+a sala em si.
+
+Motivos de encerramento registrados em `finishReason` do convite: `expired`,
+`approval_timeout`, `declined_by_agent`, `denied_by_owner`,
+`cancelled_by_owner`, `left_by_agent`, `room_closed`, `room_expired`.
 
 ---
 
-## Fluxo completo
+## Fluxo completo (dois atendentes, um recusa)
 
 ```
-Usuário                         Servidor                        Atendente
-  │  support:register              │                               │
-  ├───────────────────────────────▶  registra, entra nas salas     │
-  │  ◀── ack { user, bootstrap } ──┤                               │
-  │                                │       support:register        │
-  │                                ◀───────────────────────────────┤
-  │                                │  ── agents:list (broadcast) ──▶│
+Usuário (dono)                  Servidor                    Atendente B / C
+  │  room:create {agentIds:[B,C]}  │                               │
+  ├───────────────────────────────▶  cria sala open + 2 convites   │
+  │  ◀── ack { room, invites } ────┤                               │
+  │                                │  ── invite:received ─────────▶ B, C
   │                                │                               │
-  │  ticket:create {agentIds,mode} │                               │
-  ├───────────────────────────────▶  cria sessão + tickets         │
-  │                                │  ──── ticket:created ────────▶ │
+  │                                │      invite:decline (B)       │
+  │  ◀──── invite:updated ─────────┼──────────────────────────────┤
   │                                │                               │
-  │                                │      ticket:accept            │
-  │                                ◀───────────────────────────────┤
-  │  ◀─ session:approval_requested ┤                               │
+  │                                │      invite:accept (C)        │
+  │  ◀── owner:approval_requested ─┼──────────────────────────────┤
+  │  invite:approve {approved:true}│                               │
+  ├───────────────────────────────▶  C entra na sala               │
+  │                                │  ── participant:joined ──────▶ C
   │                                │                               │
-  │  session:confirm {approved}    │                               │
-  ├───────────────────────────────▶  ativa sessão, junta à sala    │
-  │  ◀──────── session:active ─────┼──────── session:active ──────▶ │
+  │  ══════════ eventos de co-browsing na sala room:{code} ══════ │
+  │  presence:update / cobrowsing:event ──▶ retransmite ──▶ ambos  │
   │                                │                               │
-  │  ══════════ eventos de co-browsing na sala session:{code} ════ │
-  │  presence:update / cobrowsing:event ──▶ retransmite ──▶ ambos   │
+  │  room:invite {agentIds:[D]}    │   (sala já ativa — dinâmico)  │
+  ├───────────────────────────────▶  cria convite adicional        │
+  │                                │  ── invite:received ─────────▶ D
+  │                                │        (repete aceite/aprovação)
   │                                │                               │
-  │                                │     permission:request        │
-  │  ◀──── permission:requested ───┼───────────────────────────────┤
-  │  permission:grant              │                               │
-  ├───────────────────────────────▶  atualiza estado               │
-  │  ◀── permission:state (verdade) ──── permission:state ────────▶ │
+  │                                │   driver:claim (C)            │
+  │  ◀──────── driver:changed ─────┼──────── driver:changed ──────▶ C, D
+  │  ◀── remote:command_received ──┤◀──────── remote:command ─────┤ C (piloto)
+  │                                │       remote:command (D) ────┤ D → descartado
   │                                │                               │
-  │                                │  remote:command (se Control)  │
-  │  ◀── remote:command_received ──┤◀──────────────────────────────┤
+  │                                │      room:leave (C)           │
+  │  ◀──── participant:left ───────┼──────── participant:left ────▶ D
   │                                │                               │
-  │  session:finish                │                               │
+  │  room:close                    │                               │
   ├───────────────────────────────▶  encerra, esvazia a sala       │
-  │  ◀──────── session:finished ───┼──────── session:finished ────▶ │
+  │  ◀──────── room:closed ────────┼──────── room:closed ─────────▶ D
 ```
-
-Narrado em prosa:
-
-1. **Registro.** Cada lado envia `support:register` com sua identidade e
-   permissões. O servidor coloca o socket nas salas `user:{id}` e
-   `ctx:{contextCode}`, responde com o `bootstrap` (estado corrente relevante ao
-   usuário) e faz broadcast da lista de atendentes atualizada.
-2. **Pedido.** O usuário escolhe um ou mais atendentes e envia `ticket:create`.
-   O servidor recusa se o usuário já tiver um atendimento em andamento.
-3. **Aceite.** Cada atendente recebe `ticket:created` e pode aceitar. O primeiro
-   aceite dispara `session:approval_requested` para o usuário.
-4. **Confirmação.** O usuário aprova (ou recusa) via `session:confirm`. Na
-   aprovação, todos os participantes entram na sala `session:{code}` e recebem
-   `session:active`.
-5. **Co-browsing.** A partir daí, `presence:update` e `cobrowsing:event` são
-   retransmitidos **apenas dentro da sala** da sessão. O servidor não interpreta
-   o conteúdo — apenas roteia e arquiva um histórico limitado.
-6. **Permissões.** O atendente pede permissões (`permission:request`); o usuário
-   concede/revoga (`permission:grant` / `permission:revoke`). Após cada mudança,
-   o servidor emite `permission:state`.
-7. **Controle remoto.** Com `ControlCoBrowsing` concedida, o `remote:command` do
-   atendente é entregue ao usuário como `remote:command_received`. Sem a
-   permissão, o comando é silenciosamente descartado.
-8. **Encerramento.** Qualquer participante encerra com `session:finish`; todos
-   recebem `session:finished` e a sala é dissolvida.
 
 ---
 
@@ -231,15 +230,21 @@ eventos de co-browsing ele é preservado no histórico.
 |---|---|---|
 | `support:register` | `{ userId, name, email?, avatar?, permissions? }` | `{ user, bootstrap }` |
 | `support:agents:list` | — | `{ agents }` |
-| `ticket:create` | `{ agentIds? \| agentId?, mode, permissions? }` | `{ ticket, tickets, session }` |
-| `ticket:accept` | `{ ticketId }` | `{ ticket, session }` |
-| `session:confirm` | `{ sessionCode, approved }` | `{ ticket, session }` |
-| `session:finish` | `{ sessionCode, reason? }` | — |
-| `session:heartbeat` | `{ sessionCode }` | — |
-| `permission:request` | `{ sessionCode, permissions }` | `{ sessionCode, permissions, pendingPermissions }` |
-| `permission:cancel` | `{ sessionCode, permissions }` | idem |
-| `permission:grant` | `{ sessionCode, permissions }` | idem |
-| `permission:revoke` | `{ sessionCode, permissions }` | idem |
+| `room:create` | `{ agentIds, mode, permissions? }` | `{ room, invites }` |
+| `room:invite` | `{ roomCode, agentIds }` | `{ room, invites }` |
+| `room:leave` | `{ roomCode }` | — |
+| `room:close` | `{ roomCode }` | — |
+| `room:heartbeat` | `{ roomCode }` | — |
+| `invite:accept` | `{ inviteId }` | `{ invite, room }` |
+| `invite:decline` | `{ inviteId }` | `{ invite }` |
+| `invite:cancel` | `{ inviteId }` | `{ invite }` |
+| `invite:approve` | `{ inviteId, approved }` | `{ invite, room }` |
+| `driver:claim` | `{ roomCode }` | `{ roomCode, driverId }` |
+| `driver:release` | `{ roomCode }` | `{ roomCode, driverId }` |
+| `permission:request` | `{ roomCode, permissions }` | `{ roomCode, permissions, pendingPermissions }` |
+| `permission:cancel` | `{ roomCode, permissions }` | idem |
+| `permission:grant` | `{ roomCode, permissions }` | idem |
+| `permission:revoke` | `{ roomCode, permissions }` | idem |
 
 ### Client → Server (sem ack — fire-and-forget)
 
@@ -248,15 +253,16 @@ ou best-effort:
 
 | Evento | `data` |
 |---|---|
-| `presence:update` | `{ sessionCode, cursorX?, cursorY?, route?, scrollX?, scrollY?, ... }` |
-| `cobrowsing:event` | `{ sessionCode, type, payload? }` |
-| `remote:command` | `{ sessionCode, type, targetSupportId?, route?, scroll*?, value?, at? }` |
+| `presence:update` | `{ roomCode, cursorX?, cursorY?, route?, scrollX?, scrollY?, ... }` |
+| `cobrowsing:event` | `{ roomCode, type, payload? }` |
+| `remote:command` | `{ roomCode, type, targetSupportId?, route?, scroll*?, value?, at? }` — descartado se o emissor não for o piloto atual (`driverId`). |
 
 ### Server → Client
 
-`support:bootstrap`, `agents:list`, `ticket:created`, `ticket:accepted`,
-`session:approval_requested`, `session:active`, `session:finished`,
-`participant:joined`, `participant:left`, `presence:updated`,
+`support:bootstrap`, `agents:list`, `room:created` *(não emitido separadamente
+hoje — o ack de `room:create` já entrega a sala)*, `room:closed`,
+`invite:received`, `invite:updated`, `owner:approval_requested`,
+`participant:joined`, `participant:left`, `driver:changed`, `presence:updated`,
 `cobrowsing:event_received`, `log:appended`, `permission:requested`,
 `permission:granted`, `permission:revoked`, `permission:state`,
 `remote:command_received`.
@@ -265,23 +271,25 @@ ou best-effort:
 
 ## Salas e roteamento
 
-O isolamento entre atendimentos é feito por **salas** (rooms):
+O isolamento entre atendimentos é feito por **salas** (rooms do Socket.IO):
 
-| Sala | Quem está nela | Para quê |
+| Sala (transporte) | Quem está nela | Para quê |
 |---|---|---|
-| `user:{userId}` | Todas as conexões de um mesmo usuário | Entregar mensagens direcionadas a uma pessoa, independentemente da aba. |
+| `user:{userId}` | Todas as conexões de um mesmo usuário | Entregar mensagens direcionadas a uma pessoa, independentemente da aba — inclusive convites, antes de a pessoa entrar na sala de suporte. |
 | `ctx:{contextCode}` | Todos os registrados de um contexto | Broadcast da lista de atendentes. |
-| `session:{code}` | Participantes ativos da sessão | Retransmitir presença, eventos de co-browsing e mudanças de permissão. |
+| `room:{code}` | Participantes efetivamente na sala (dono + atendentes que entraram) | Retransmitir presença, eventos de co-browsing, comandos de controle e mudanças de permissão/piloto. |
 
-Eventos de co-browsing usam retransmissão **para a sala exceto o remetente**, de
-modo que quem originou o evento não o recebe de volta.
+Eventos de co-browsing usam retransmissão **para a sala exceto o remetente**,
+de modo que quem originou o evento não o recebe de volta. Convites e
+aprovações são entregues via `user:{userId}`, pois o destinatário ainda não
+está na sala `room:{code}`.
 
 ---
 
 ## Persistência efêmera e limites
 
-- **Histórico da sessão** é limitado em memória: no máximo 200 eventos de
-  co-browsing e 200 logs por sessão, sempre com os mais recentes no topo.
+- **Histórico da sala** é limitado em memória: no máximo 200 eventos de
+  co-browsing e 200 logs por sala, sempre com os mais recentes no topo.
 - **Eventos de alta frequência** (`scroll_changed`, `pointer_moved`) são
   retransmitidos, mas **não** geram entrada de log — evitando poluir o
   histórico. Os demais viram `log:appended`.
@@ -296,25 +304,31 @@ O servidor aplica prazos automáticos e roda um **sweeper** periódico:
 
 | Prazo | Valor | Efeito ao estourar |
 |---|---|---|
-| Aceite do ticket | 60 s | Ticket em `requested` vira `expired`. |
-| Confirmação do usuário | 90 s | Ticket aceito e não confirmado vira `expired` (`approval_timeout`). |
-| Sessão sem heartbeat | 2 min | Sessão ativa com participante desconectado é encerrada como `expired`. |
-| Intervalo do sweeper | 15 s | Frequência com que sessões obsoletas são varridas. |
+| Resposta ao convite | 60 s | Convite em `pending` vira `expired`. |
+| Aprovação do dono | 90 s | Convite aceito e não aprovado vira `expired` (`approval_timeout`). |
+| Sala sem heartbeat do dono | 2 min | Sala aberta cujo **dono** está desconectado e sem heartbeat é encerrada como `expired`. |
+| Intervalo do sweeper | 15 s | Frequência com que salas obsoletas são varridas. |
 
-Enquanto a sessão está ativa, cada participante envia `session:heartbeat`
-periodicamente. Se uma conexão cai, o participante é marcado como desconectado
-(mas permanece na sessão); se não voltar a tempo, o sweeper encerra a sessão.
+O sweeper avalia **apenas a conexão do dono** — um atendente desconectado
+nunca encerra a sala; ele só fica marcado como offline (e, se era o piloto,
+perde o token). Enquanto a sala está aberta, cada participante envia
+`room:heartbeat` periodicamente.
 
 ---
 
 ## Resiliência de conexão
 
 - **Reconexão.** Ao registrar novamente, o servidor recoloca o socket nas salas
-  das sessões ativas de que a pessoa participa, marca o participante como
-  conectado e notifica os demais com `participant:joined`.
+  cujo participante já é conhecido, marca o participante como conectado e
+  notifica os demais com `participant:joined`.
 - **Queda de aba.** Enquanto restar ao menos uma conexão do usuário, ele
-  continua online. Na queda da última, ele é marcado offline, a lista de
-  atendentes é rebroadcast e as sessões ativas recebem `participant:left`.
+  continua online. Na queda da última, ele é marcado offline nas salas abertas
+  de que participa; se era o piloto, o token é liberado
+  (`driver:changed { driverId: null }`).
+- **Saída explícita (`room:leave`).** Se quem sai é um atendente, a sala
+  continua normalmente para o dono e os demais atendentes; o convite dele é
+  marcado `left`. Se quem sai é o **dono**, a sala é encerrada
+  (equivalente a `room:close`).
 
 ---
 
@@ -328,9 +342,9 @@ Retornados no ack (`error.code`) quando um evento com confirmação falha:
 | `INVALID_PAYLOAD` | Campos obrigatórios ausentes ou permissão de sessão inválida. |
 | `FORBIDDEN` | Ação não permitida para o papel/permissão do solicitante. |
 | `AGENT_NOT_FOUND` | Atendente informado não existe ou não é atendente. |
-| `TICKET_NOT_FOUND` | Ticket inexistente. |
-| `SESSION_NOT_FOUND` | Sessão inexistente. |
-| `INVALID_STATE` | Transição incompatível com o estado atual do ticket/sessão. |
-| `ALREADY_HAS_OPEN_TICKET` | Usuário já tem um atendimento em andamento. |
+| `INVITE_NOT_FOUND` | Convite inexistente. |
+| `ROOM_NOT_FOUND` | Sala inexistente. |
+| `INVALID_STATE` | Transição incompatível com o estado atual do convite/sala. |
+| `ALREADY_HAS_OPEN_ROOM` | O usuário já é dono de uma sala aberta (`room:create`; não se aplica a `room:invite`, que é o caminho para convidar mais gente numa sala já aberta). |
+| `DRIVER_BUSY` | Outro atendente já é o piloto atual da sala. |
 | `INTERNAL_ERROR` | Falha não prevista. |
-```
